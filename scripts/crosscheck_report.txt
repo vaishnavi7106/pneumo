@@ -1,0 +1,15 @@
+Ground-truth report shape: (404, 19)
+Columns: ['匿名病歷號', '性別', '年齡', '匿名申請序號', '電腦斷層掃描日期', 'note_text', 'Pneumoperitoneum_Label', 'Main_Gas_Category', 'Perforation_Related_Gas', 'Other_Gas_Location', 'Suspected_Perforation', 'Gas_Location_Summary', 'Evidence_Text', 'Confidence', 'Suggested_Binary_StrictPneumo', 'Review_Flag', 'Free_Air_Location_in_note_text', 'Keep_In_Dataset', 'Exclude_Reason']
+
+Rows with Keep_In_Dataset==True: 363
+Volumes on disk: 363
+
+Unmatched volumes (no GT row found): 0
+
+Files matched to >1 GT row (duplicate-merge bug check): 0
+
+Label mismatches (on-disk folder vs GT report): 0
+
+GT-kept rows with no matching file on disk: 0
+
+Final matched count: 363 / 363

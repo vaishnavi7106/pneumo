@@ -1,0 +1,19 @@
+# big / generated stuff -- keep dataset, bundle weights, venv, and training
+# outputs out of the repo; scripts/ (code + small csv/png analysis outputs) is tracked
+venv/
+__pycache__/
+*.pyc
+merged/
+vista3d/
+runs/
+cache/
+checkpoints/
+*.nii.gz
+*.pt
+*.npz
+
+# dataset ground-truth spreadsheet (PHI-adjacent, not code)
+*.xlsx
+
+# claude session/config dir
+.claude/

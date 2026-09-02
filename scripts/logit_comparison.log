@@ -1,0 +1,38 @@
+Linear probe checkpoint: C:\Users\User1\pneumo_dataset\runs\run_20260901_154953\checkpoints\best.pt
+Fine-tune checkpoint: C:\Users\User1\pneumo_dataset\runs\finetune_20260902_102718\checkpoints\best.pt
+
+Running linear-probe (epoch 39) CPU inference on val set...
+  10/54 (131s elapsed)
+  20/54 (267s elapsed)
+  30/54 (404s elapsed)
+  40/54 (545s elapsed)
+  50/54 (693s elapsed)
+Linear probe checkpoint epoch=39, score=0.7474327729337518
+
+Running fine-tune (current best) CPU inference on val set...
+  10/54 (146s elapsed)
+  20/54 (290s elapsed)
+  30/54 (434s elapsed)
+  40/54 (578s elapsed)
+  50/54 (723s elapsed)
+Fine-tune checkpoint epoch=5, score=0.790248448691325
+
+=== LINEAR PROBE (epoch 39, auprc=0.7474) ===
+  n=54
+  mean |logit| = 0.839, median = 0.632, std = 0.804
+  max |logit| = 4.882, min |logit| = 0.018
+  logit range: [-4.882, 1.291]
+  |logit| > 10 (very confident): 0/54
+  NaN: False, Inf: False
+
+=== FINE-TUNE (epoch 5, auprc=0.7902) ===
+  n=54
+  mean |logit| = 0.673, median = 0.482, std = 0.801
+  max |logit| = 4.861, min |logit| = 0.033
+  logit range: [-4.861, 1.297]
+  |logit| > 10 (very confident): 0/54
+  NaN: False, Inf: False
+
+=== COMPARISON ===
+mean |logit|: linear probe=0.839 -> fine-tune=0.673 (-0.166, -19.8% change)
+Any NaN/Inf anywhere: False
