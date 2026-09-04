@@ -109,7 +109,7 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    unfreeze_stages = [4] if args.unfreeze_stages == 1 else [3, 4]
+    unfreeze_stages = {1: [4], 2: [3, 4], 3: [3]}[args.unfreeze_stages]
 
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
@@ -319,9 +319,10 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, default=None,
                     help="path to linear-probe checkpoints/best.pt (default: auto-find latest under --runs-dir)")
     p.add_argument("--runs-dir", type=str, default=os.path.join(ROOT, "runs"))
-    p.add_argument("--unfreeze-stages", type=int, default=1, choices=[1, 2],
+    p.add_argument("--unfreeze-stages", type=int, default=1, choices=[1, 2, 3],
                     help="1 = unfreeze stage 4 only (127.4M params, 72.8%% of encoder); "
-                         "2 = unfreeze stage 3+4 (167.3M params, 95.6%% of encoder)")
+                         "2 = unfreeze stage 3+4 (167.3M params, 95.6%% of encoder); "
+                         "3 = unfreeze stage 3 only (39.8M params, 22.8%% of encoder)")
     p.add_argument("--patch-size", type=int, default=224)
     p.add_argument("--batch-size", type=int, default=1,
                     help="physical batch size; default 1 because batch_size=4 OOMs and batch_size=2 "

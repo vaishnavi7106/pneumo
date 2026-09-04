@@ -78,7 +78,7 @@ def make_linear_probe_args(seed, patience, max_epochs):
     return argparse.Namespace(
         patch_size=224, batch_size=1, accum_steps=4, amp=True,
         epochs=max_epochs, patience=patience, lr=1e-3, hidden_dim=128, dropout=0.3,
-        seed=seed, num_workers=0, selection_metric="auprc",
+        seed=seed, num_workers=0, selection_metric="auprc", augment=True,
     )
 
 
@@ -87,7 +87,7 @@ def make_finetune_args(seed):
         unfreeze_stages=1, patch_size=224, batch_size=1, accum_steps=4, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
-        seed=seed, num_workers=0, selection_metric="auprc", time_probe_epochs=0,
+        seed=seed, num_workers=0, selection_metric="auprc", time_probe_epochs=0, augment=True,
     )
 
 
