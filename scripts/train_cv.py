@@ -98,11 +98,13 @@ def get_probs_for_files(checkpoint_path, filepaths, patch_size=224):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
 
-    ds = PneumoDataset(filepaths, patch_size=(patch_size,) * 3)
+    ds = PneumoDataset(filepaths, patch_size=(patch_size,) * 3,
+                        air_mask_threshold=config.get("air_mask_threshold"))
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     model = VistaClassifier(freeze_encoder=True, hidden_dim=config.get("hidden_dim", 128),
-                             dropout=config.get("dropout", 0.3)).to(device)
+                             dropout=config.get("dropout", 0.3),
+                             in_channels=config.get("in_channels", 1)).to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
 

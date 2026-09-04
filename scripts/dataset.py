@@ -36,6 +36,13 @@ PATCH_SIZE = (128, 128, 128)
 EXTENDED_FOV_THRESHOLD_MM = 375.0
 BATCH_SIZE = 4
 
+# optional second input channel: a binary/soft air mask from thresholding raw
+# HU (computed AFTER resample+crop but BEFORE the [0,1] intensity
+# normalization -- see PneumoDataset._preprocess). -600 HU is the suggested
+# starting point (air is roughly -1000 to -600 HU); kept as a tunable
+# threshold, not hardcoded into the training scripts, for later sweeping.
+DEFAULT_AIR_MASK_THRESHOLD = -600.0
+
 
 def _load_reoriented_resampled(filepath: str) -> MetaTensor:
     img = nib.load(filepath)
@@ -71,7 +78,7 @@ CACHE_DIR = os.path.join(ROOT, "cache")
 
 class PneumoDataset(Dataset):
     def __init__(self, filepaths, audit_csv=AUDIT_CSV, roi_bbox_csv=ROI_BBOX_CSV, patch_size=PATCH_SIZE,
-                 cache_dir=CACHE_DIR, use_cache=True, augment=False):
+                 cache_dir=CACHE_DIR, use_cache=True, augment=False, air_mask_threshold=None):
         self.filepaths = list(filepaths)
         self.patch_size = tuple(patch_size)
         self.use_cache = use_cache
@@ -79,9 +86,17 @@ class PneumoDataset(Dataset):
         # augment.py) -- never set True for val/test, or metrics would be
         # measured against a moving target instead of a fixed evaluation set
         self.augment = augment
-        # cache is keyed by patch_size since the same volume produces a different
-        # tensor at 128^3 vs 224^3 -- final resize step depends on it
-        self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}") if use_cache else None
+        # None = single-channel (CT intensity only, original behavior). A float
+        # enables a 2nd channel: 1.0 where raw HU < threshold, else 0.0 (soft
+        # after resize, since resize uses trilinear interpolation) -- see
+        # model.py's build_pretrained_encoder(in_channels=2) for how the
+        # encoder's first conv is adapted to consume it.
+        self.air_mask_threshold = air_mask_threshold
+        # cache is keyed by patch_size AND channel config since the same volume
+        # produces a different tensor at 128^3 vs 224^3, and a 1-channel vs
+        # 2-channel (air-mask) tensor is a completely different shape/content
+        channel_suffix = f"_airmask{air_mask_threshold:g}" if air_mask_threshold is not None else ""
+        self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}{channel_suffix}") if use_cache else None
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -125,13 +140,27 @@ class PneumoDataset(Dataset):
             bbox_min_mm, bbox_max_mm = self.roi[filepath]
             data = _crop_to_bbox_mm(data, bbox_min_mm, bbox_max_mm)
 
-        x = torch.as_tensor(np.asarray(data), dtype=torch.float32)
-        x = torch.clamp(x, HU_A_MIN, HU_A_MAX)
-        x = (x - HU_A_MIN) / (HU_A_MAX - HU_A_MIN)
+        # raw HU, post-resample+crop, PRE-normalization -- the air mask (if
+        # enabled) is thresholded on this, not on the [0,1]-scaled intensity.
+        # shape is [1, X, Y, Z] (leading 1 = channel dim from nib.get_fdata()[None])
+        raw_hu = torch.as_tensor(np.asarray(data), dtype=torch.float32)
 
-        x = x.unsqueeze(0)  # [1, 1, X, Y, Z]
+        x = torch.clamp(raw_hu, HU_A_MIN, HU_A_MAX)
+        x = (x - HU_A_MIN) / (HU_A_MAX - HU_A_MIN)
+        x = x.unsqueeze(0)  # [1, 1, X, Y, Z] (batch, channel, spatial)
         x = F.interpolate(x, size=self.patch_size, mode="trilinear", align_corners=False)
         x = x.squeeze(0)  # [1, *patch_size]
+
+        if self.air_mask_threshold is not None:
+            mask = (raw_hu < self.air_mask_threshold).float()
+            mask = mask.unsqueeze(0)  # [1, 1, X, Y, Z]
+            # trilinear (not nearest) so the mask resizes with the same
+            # interpolation as the intensity channel -- produces a "soft" mask
+            # at patch_size resolution (values between 0/1 at former edges)
+            mask = F.interpolate(mask, size=self.patch_size, mode="trilinear", align_corners=False)
+            mask = mask.squeeze(0)  # [1, *patch_size]
+            x = torch.cat([x, mask], dim=0)  # [2, *patch_size]
+
         return x
 
     def __getitem__(self, idx):
@@ -160,10 +189,11 @@ class PneumoDataset(Dataset):
 
 
 def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE,
-                      augment_train: bool = False):
+                      augment_train: bool = False, air_mask_threshold=None):
     loaders = {}
     for name, filepaths in splits.items():
-        ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"))
+        ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"),
+                            air_mask_threshold=air_mask_threshold)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             num_workers=num_workers, pin_memory=True,

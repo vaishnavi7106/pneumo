@@ -52,8 +52,12 @@ def random_rotate(x: torch.Tensor, axis: int, angle_deg: float) -> torch.Tensor:
 
 
 def augment_volume(x: torch.Tensor, rng: np.random.RandomState = None) -> torch.Tensor:
-    """x: [1, D, H, W] float tensor in [0, 1] (post crop/resize). Returns an
-    augmented copy of the same shape, still clamped to [0, 1]."""
+    """x: [C, D, H, W] float tensor (channel 0 = CT intensity in [0, 1]; an
+    optional channel 1 = air mask, see dataset.py's air_mask_threshold).
+    Flip/rotate are spatial and apply identically to every channel (grid_sample
+    broadcasts over C). Intensity scale/shift, however, is only meaningful for
+    the CT-intensity channel -- applying it to a 0/1 air mask would corrupt
+    its semantics, so it's applied to channel 0 ONLY."""
     rng = rng or np.random.RandomState()
 
     # L-R flip only (array axis 1 = dim after channel, corresponds to the R-L
@@ -71,7 +75,7 @@ def augment_volume(x: torch.Tensor, rng: np.random.RandomState = None) -> torch.
 
     scale = rng.uniform(*INTENSITY_SCALE_RANGE)
     shift = rng.uniform(*INTENSITY_SHIFT_RANGE)
-    x = x * scale + shift
-    x = torch.clamp(x, 0.0, 1.0)
+    x = x.clone()
+    x[0] = torch.clamp(x[0] * scale + shift, 0.0, 1.0)
 
     return x

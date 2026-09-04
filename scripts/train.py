@@ -290,18 +290,26 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    air_mask_threshold = getattr(args, "air_mask_threshold", None)
+    in_channels = 2 if air_mask_threshold is not None else 1
+
     config = vars(args).copy()
     config["device"] = device
     config["gpu_name"] = torch.cuda.get_device_name(0) if device == "cuda" else None
     config["selection_metric"] = args.selection_metric
+    config["air_mask_threshold"] = air_mask_threshold
+    config["in_channels"] = in_channels
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
 
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
+        air_mask_threshold=air_mask_threshold,
     )
     print({k: len(v) for k, v in splits.items()})
+    if air_mask_threshold is not None:
+        print(f"Air-mask channel ENABLED: threshold={air_mask_threshold} HU, in_channels=2")
 
     # class imbalance in the train split: weight the positive class by neg/pos
     # ratio so BCEWithLogitsLoss doesn't let the model collapse to predicting
@@ -322,7 +330,8 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
         json.dump(config, f, indent=2)
     print(f"Saved config to {os.path.join(run_dir, 'config.json')}")
 
-    model = VistaClassifier(freeze_encoder=True, hidden_dim=args.hidden_dim, dropout=args.dropout).to(device)
+    model = VistaClassifier(freeze_encoder=True, hidden_dim=args.hidden_dim, dropout=args.dropout,
+                             in_channels=in_channels).to(device)
     optimizer = build_optimizer(model, args.lr)
     scaler = torch.amp.GradScaler(device="cuda", enabled=(args.amp and device == "cuda"))
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
@@ -444,6 +453,9 @@ def parse_args():
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--augment", action="store_true", default=False,
                     help="apply train-only 3D augmentation (flip/rotate/intensity jitter, see augment.py)")
+    p.add_argument("--air-mask-threshold", type=float, default=None,
+                    help="if set, add a 2nd input channel: 1.0 where raw HU < threshold else 0.0 "
+                         "(e.g. -600 for air). Default None = original 1-channel (intensity only).")
     return p.parse_args()
 
 

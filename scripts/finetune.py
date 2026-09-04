@@ -76,13 +76,25 @@ def build_finetune_optimizer(model: VistaClassifier, encoder_lr: float, head_lr:
     ])
 
 
-def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str) -> VistaClassifier:
+def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str,
+                          expected_air_mask_threshold=None) -> VistaClassifier:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     src_config = ckpt.get("config", {})
     hidden_dim = src_config.get("hidden_dim", 128)
     dropout = src_config.get("dropout", 0.3)
+    in_channels = src_config.get("in_channels", 1)
 
-    model = VistaClassifier(freeze_encoder=True, hidden_dim=hidden_dim, dropout=dropout)
+    # catch an accidental mismatch (e.g. fine-tuning with --air-mask-threshold
+    # set/unset differently than the source linear-probe checkpoint was
+    # trained with) before it silently trains a randomly-shaped conv_init
+    src_air_mask_threshold = src_config.get("air_mask_threshold")
+    assert src_air_mask_threshold == expected_air_mask_threshold, (
+        f"air_mask_threshold mismatch: source checkpoint was trained with "
+        f"{src_air_mask_threshold!r}, but this run was asked for {expected_air_mask_threshold!r}"
+    )
+
+    model = VistaClassifier(freeze_encoder=True, hidden_dim=hidden_dim, dropout=dropout,
+                             in_channels=in_channels)
     missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     print(f"Loaded checkpoint: {checkpoint_path}")
@@ -114,9 +126,11 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
 
+    air_mask_threshold = getattr(args, "air_mask_threshold", None)
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
+        air_mask_threshold=air_mask_threshold,
     )
     print({k: len(v) for k, v in splits.items()})
 
@@ -127,7 +141,8 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     pos_weight_value = n_neg / n_pos
     print(f"Train split class balance: {n_pos} positive, {n_neg} negative -> pos_weight={pos_weight_value:.4f}")
 
-    model, src_ckpt = load_from_checkpoint(checkpoint_path, unfreeze_stages, device)
+    model, src_ckpt = load_from_checkpoint(checkpoint_path, unfreeze_stages, device,
+                                            expected_air_mask_threshold=air_mask_threshold)
     optimizer = build_finetune_optimizer(model, args.encoder_lr, args.head_lr)
     scaler = torch.amp.GradScaler(device="cuda", enabled=(args.amp and device == "cuda"))
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
@@ -193,7 +208,7 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
         "gpu_name": torch.cuda.get_device_name(0) if device == "cuda" else None,
         "source_checkpoint": checkpoint_path,
         "source_epoch": src_ckpt.get("epoch"), "source_val_metrics": src_ckpt.get("val_metrics"),
-        "unfreeze_stage_indices": unfreeze_stages,
+        "unfreeze_stage_indices": unfreeze_stages, "in_channels": model.in_channels,
         "train_n_pos": int(n_pos), "train_n_neg": int(n_neg), "pos_weight": float(pos_weight_value),
         "steps_per_epoch": steps_per_epoch, "warmup_steps": warmup_steps,
     })
@@ -359,6 +374,9 @@ def parse_args():
                     help="if >0, run only this many epochs then report per-epoch timing and ETA, then exit")
     p.add_argument("--augment", action="store_true", default=False,
                     help="apply train-only 3D augmentation (flip/rotate/intensity jitter, see augment.py)")
+    p.add_argument("--air-mask-threshold", type=float, default=None,
+                    help="must match the source linear-probe checkpoint's setting -- if it was trained "
+                         "with a 2nd air-mask channel, this run must use the same threshold")
     return p.parse_args()
 
 

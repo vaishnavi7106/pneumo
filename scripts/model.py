@@ -30,12 +30,22 @@ RESAMPLE_SPACING = (1.5, 1.5, 1.5)
 PATCH_SIZE = (128, 128, 128)
 
 
-def build_pretrained_encoder(checkpoint_path: str = BUNDLE_CKPT) -> SegResEncoder:
-    """Build the SegResEncoder backbone and load VISTA3D's pretrained weights into it."""
+def build_pretrained_encoder(checkpoint_path: str = BUNDLE_CKPT, in_channels: int = 1) -> SegResEncoder:
+    """Build the SegResEncoder backbone and load VISTA3D's pretrained weights into it.
+
+    in_channels=1: standard single-channel (CT intensity only), loads strictly.
+    in_channels=2: adds a second input channel (e.g. an HU-thresholded air mask,
+    see dataset.py's air_mask_threshold). VISTA3D's pretrained conv_init.weight
+    is (48, 1, 3, 3, 3) -- only channel 0 has pretrained weights. Channel 0 gets
+    those pretrained weights exactly as in the 1-channel case; every additional
+    channel is zero-initialized, so a forward pass with those extra channels
+    all zero is mathematically IDENTICAL to the original 1-channel network
+    before any training happens (verified in verify_air_mask_equivalence.py).
+    """
     encoder = SegResEncoder(
         spatial_dims=3,
         init_filters=ENCODER_EMBED_DIM,
-        in_channels=1,
+        in_channels=in_channels,
         norm="instance",
         blocks_down=BLOCKS_DOWN,
     )
@@ -46,8 +56,21 @@ def build_pretrained_encoder(checkpoint_path: str = BUNDLE_CKPT) -> SegResEncode
 
     prefix = "image_encoder.encoder."
     encoder_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
-    missing, unexpected = encoder.load_state_dict(encoder_sd, strict=True)
-    assert not missing and not unexpected, (missing, unexpected)
+
+    if in_channels == 1:
+        missing, unexpected = encoder.load_state_dict(encoder_sd, strict=True)
+        assert not missing and not unexpected, (missing, unexpected)
+    else:
+        pretrained_conv_init = encoder_sd.pop("conv_init.weight")  # (48, 1, 3, 3, 3)
+        missing, unexpected = encoder.load_state_dict(encoder_sd, strict=False)
+        assert unexpected == [], unexpected
+        assert missing == ["conv_init.weight"], missing
+        assert pretrained_conv_init.shape[1] == 1, pretrained_conv_init.shape
+
+        new_conv_init = torch.zeros_like(encoder.conv_init.weight)  # (48, in_channels, 3, 3, 3)
+        new_conv_init[:, 0:1] = pretrained_conv_init
+        with torch.no_grad():
+            encoder.conv_init.weight.copy_(new_conv_init)
 
     return encoder
 
@@ -56,9 +79,10 @@ class VistaClassifier(nn.Module):
     """Frozen (or fine-tunable) VISTA3D encoder + global-pool linear-probe head."""
 
     def __init__(self, checkpoint_path: str = BUNDLE_CKPT, freeze_encoder: bool = True,
-                 hidden_dim: int = 128, dropout: float = 0.3):
+                 hidden_dim: int = 128, dropout: float = 0.3, in_channels: int = 1):
         super().__init__()
-        self.encoder = build_pretrained_encoder(checkpoint_path)
+        self.in_channels = in_channels
+        self.encoder = build_pretrained_encoder(checkpoint_path, in_channels=in_channels)
         self.freeze_encoder = freeze_encoder
         self.set_encoder_trainable(not freeze_encoder)
 
