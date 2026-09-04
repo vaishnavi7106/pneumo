@@ -116,7 +116,7 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
 
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
     )
     print({k: len(v) for k, v in splits.items()})
 
@@ -356,6 +356,8 @@ def parse_args():
     p.add_argument("--selection-metric", type=str, default="auprc", choices=["auprc", "auroc"])
     p.add_argument("--time-probe-epochs", type=int, default=0,
                     help="if >0, run only this many epochs then report per-epoch timing and ETA, then exit")
+    p.add_argument("--augment", action="store_true", default=False,
+                    help="apply train-only 3D augmentation (flip/rotate/intensity jitter, see augment.py)")
     return p.parse_args()
 
 

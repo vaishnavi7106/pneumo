@@ -23,6 +23,8 @@ from monai.data import MetaTensor
 from monai.transforms import Orientation, Spacing
 from torch.utils.data import DataLoader, Dataset
 
+from augment import augment_volume
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIT_CSV = os.path.join(ROOT, "scripts", "audit_results.csv")
 ROI_BBOX_CSV = os.path.join(ROOT, "scripts", "roi_bboxes.csv")
@@ -69,10 +71,14 @@ CACHE_DIR = os.path.join(ROOT, "cache")
 
 class PneumoDataset(Dataset):
     def __init__(self, filepaths, audit_csv=AUDIT_CSV, roi_bbox_csv=ROI_BBOX_CSV, patch_size=PATCH_SIZE,
-                 cache_dir=CACHE_DIR, use_cache=True):
+                 cache_dir=CACHE_DIR, use_cache=True, augment=False):
         self.filepaths = list(filepaths)
         self.patch_size = tuple(patch_size)
         self.use_cache = use_cache
+        # train-only stochastic augmentation, applied AFTER cache load (see
+        # augment.py) -- never set True for val/test, or metrics would be
+        # measured against a moving target instead of a fixed evaluation set
+        self.augment = augment
         # cache is keyed by patch_size since the same volume produces a different
         # tensor at 128^3 vs 224^3 -- final resize step depends on it
         self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}") if use_cache else None
@@ -147,13 +153,17 @@ class PneumoDataset(Dataset):
         else:
             x = self._preprocess(filepath)
 
+        if self.augment:
+            x = augment_volume(x)
+
         return x, torch.tensor(label, dtype=torch.float32), filepath
 
 
-def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE):
+def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE,
+                      augment_train: bool = False):
     loaders = {}
     for name, filepaths in splits.items():
-        ds = PneumoDataset(filepaths, patch_size=patch_size)
+        ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"))
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             num_workers=num_workers, pin_memory=True,

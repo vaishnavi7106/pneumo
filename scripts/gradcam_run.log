@@ -1,0 +1,13 @@
+Loaded checkpoint: C:\Users\User1\pneumo_dataset\runs\finetune_20260902_140547\checkpoints\best.pt
+  epoch=5, score=0.7951055652609551
+
+Computing val-set predictions to select TP/FN/FP examples...
+
+Val set: 54 total. TP=14, FN=7, FP=4 at threshold=0.63
+
+Selected 8 volumes: 4 TP, 2 FN, 2 FP
+C:\Users\User1\pneumo_dataset\venv\lib\site-packages\torch\autograd\graph.py:825: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\aten\src\ATen\cuda\CublasHandlePool.cpp:135.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[TP] 20251028201-1.nii.gz: prob=0.872, cam4 peak voxel=(np.int64(135), np.int64(87), np.int64(72)), cam3 peak voxel=(np.int64(115), np.int64(75), np.int64(36)) -> saved C:\Users\User1\pneumo_dataset\gradcam_outputs\TP__20251028201-1.png
+[TP] 20251028360-1.nii.gz: prob=0.813, cam4 peak voxel=(np.int64(24), np.int64(216), np.int64(135)), cam3 peak voxel=(np.int64(100), np.int64(107), np.int64(11)) -> saved C:\Users\User1\pneumo_dataset\gradcam_outputs\TP__20251028360-1.png
+[TP] 20251028388-1.nii.gz: prob=0.791, cam4 peak voxel=(np.int64(119), np.int64(216), np.int64(103)), cam3 peak voxel=(np.int64(107), np.int64(116), np.int64(203)) -> saved C:\Users\User1\pneumo_dataset\gradcam_outputs\TP__20251028388-1.png

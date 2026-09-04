@@ -1,0 +1,30 @@
+C:\Users\User1\pneumo_dataset\venv\lib\site-packages\torch\autograd\graph.py:825: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\aten\src\ATen\cuda\CublasHandlePool.cpp:135.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+Running VISTA3D segmentation on 20251028201-1.nii.gz for organ lookup...
+  prob=0.873
+  stage4 (top 5% of 11239424 voxels, n=561971): background/none (91%), colon (6%), liver (3%), IVC (0%), small bowel (0%), duodenum (0%), rectum (0%), pancreas (0%), stomach (0%), portal/splenic vein (0%)
+  stage3 (top 5% of 11239424 voxels, n=561971): background/none (76%), colon (13%), liver (9%), stomach (0%), small bowel (0%), IVC (0%), rectum (0%), right kidney (0%), gallbladder (0%), duodenum (0%), pancreas (0%), left kidney (0%), portal/splenic vein (0%), kidney (0%), spleen (0%)
+  dominant organ -- stage4: background/none, stage3: background/none -- AGREE
+
+Running VISTA3D segmentation on 20251028360-1.nii.gz for organ lookup...
+  prob=0.813
+  stage4 (top 5% of 11239424 voxels, n=561971): background/none (99%), stomach (0%), colon (0%), IVC (0%)
+  stage3 (top 5% of 11239424 voxels, n=561971): background/none (90%), left kidney (3%), colon (2%), right kidney (2%), stomach (2%), IVC (0%), pancreas (0%), liver (0%), kidney (0%), portal/splenic vein (0%), spleen (0%), duodenum (0%), esophagus (0%), small bowel (0%)
+  dominant organ -- stage4: background/none, stage3: background/none -- AGREE
+Traceback (most recent call last):
+  File "C:\Users\User1\pneumo_dataset\scripts\gradcam_organ_lookup.py", line 199, in <module>
+    main()
+  File "C:\Users\User1\pneumo_dataset\scripts\gradcam_organ_lookup.py", line 185, in main
+    results.append(analyze_volume(full_fp, model, cam4, cam3))
+  File "C:\Users\User1\pneumo_dataset\scripts\gradcam_organ_lookup.py", line 132, in analyze_volume
+    cam3_map, _, _ = cam3(x, target_size=(PATCH_SIZE,) * 3)
+  File "C:\Users\User1\pneumo_dataset\scripts\gradcam.py", line 78, in __call__
+    logit.backward()
+  File "C:\Users\User1\pneumo_dataset\venv\lib\site-packages\torch\_tensor.py", line 581, in backward
+    torch.autograd.backward(
+  File "C:\Users\User1\pneumo_dataset\venv\lib\site-packages\torch\autograd\__init__.py", line 347, in backward
+    _engine_run_backward(
+  File "C:\Users\User1\pneumo_dataset\venv\lib\site-packages\torch\autograd\graph.py", line 825, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.01 GiB. GPU 0 has a total capacity of 12.00 GiB of which 0 bytes is free. Of the allocated memory 18.25 GiB is allocated by PyTorch, and 7.59 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
