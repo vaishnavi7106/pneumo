@@ -369,7 +369,11 @@ def parse_args():
     p.add_argument("--split-seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "runs"))
-    p.add_argument("--selection-metric", type=str, default="auprc", choices=["auprc", "auroc"])
+    p.add_argument("--selection-metric", type=str, default="composite",
+                    choices=["auprc", "auroc", "composite"],
+                    help="'composite' (default) blends auroc/auprc/sensitivity/specificity to avoid "
+                         "picking a degenerate near-one-class checkpoint that AUPRC alone can favor -- "
+                         "see COMPOSITE_WEIGHT_* constants in train.py's compute_metrics()")
     p.add_argument("--time-probe-epochs", type=int, default=0,
                     help="if >0, run only this many epochs then report per-epoch timing and ETA, then exit")
     p.add_argument("--augment", action="store_true", default=False,

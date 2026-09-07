@@ -49,6 +49,21 @@ def set_all_seeds(seed: int):
     }
 
 
+# Weights for the "composite" selection metric (see compute_metrics below).
+# AUPRC-only selection can pick a degenerate checkpoint that ranks a handful
+# of confident cases well (inflating AUPRC on a small val set) while barely
+# predicting positive at all (e.g. sensitivity=0.18) -- a near-useless model
+# for a screening task. Sensitivity is weighted above specificity because
+# missing a real pneumoperitoneum (false negative) is the clinically worse
+# error for this task. Tune these constants directly if the balance needs
+# adjusting; they intentionally aren't a CLI surface since the "right"
+# balance is a judgment call, not a per-run experiment variable.
+COMPOSITE_WEIGHT_AUROC = 0.25
+COMPOSITE_WEIGHT_AUPRC = 0.35
+COMPOSITE_WEIGHT_SENS = 0.25
+COMPOSITE_WEIGHT_SPEC = 0.15
+
+
 def compute_metrics(y_true, y_prob, threshold: float = 0.5):
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
@@ -66,6 +81,22 @@ def compute_metrics(y_true, y_prob, threshold: float = 0.5):
     tn, fp, fn, tp = cm.ravel()
     metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else float("nan")  # recall / TPR
     metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else float("nan")  # TNR
+    metrics["balanced_accuracy"] = (
+        (metrics["sensitivity"] + metrics["specificity"]) / 2
+        if not (np.isnan(metrics["sensitivity"]) or np.isnan(metrics["specificity"])) else float("nan")
+    )
+
+    # composite: penalizes exactly the failure mode where AUPRC/AUROC look
+    # good but sens/spec reveal the model has collapsed toward one class.
+    # Falls back to auprc-only if auroc/sens/spec are NaN (e.g. a batch/split
+    # with only one class present), so it never crashes checkpoint selection.
+    auroc_term = metrics["auroc"] if not np.isnan(metrics["auroc"]) else metrics["auprc"]
+    sens_term = metrics["sensitivity"] if not np.isnan(metrics["sensitivity"]) else 0.0
+    spec_term = metrics["specificity"] if not np.isnan(metrics["specificity"]) else 0.0
+    metrics["composite"] = (
+        COMPOSITE_WEIGHT_AUROC * auroc_term + COMPOSITE_WEIGHT_AUPRC * metrics["auprc"]
+        + COMPOSITE_WEIGHT_SENS * sens_term + COMPOSITE_WEIGHT_SPEC * spec_term
+    )
     return metrics
 
 
@@ -344,7 +375,7 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     best_score = -float("inf")
     best_epoch = -1
     epochs_since_improvement = 0
-    assert args.selection_metric in ("auprc", "auroc")
+    assert args.selection_metric in ("auprc", "auroc", "composite")
 
     patience = getattr(args, "patience", None)
     print(f"\nStarting linear-probe training: max_epochs={args.epochs} (ceiling), "
@@ -449,7 +480,11 @@ def parse_args():
     p.add_argument("--split-seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "runs"))
-    p.add_argument("--selection-metric", type=str, default="auprc", choices=["auprc", "auroc"])
+    p.add_argument("--selection-metric", type=str, default="composite",
+                    choices=["auprc", "auroc", "composite"],
+                    help="'composite' (default) blends auroc/auprc/sensitivity/specificity to avoid "
+                         "picking a degenerate near-one-class checkpoint that AUPRC alone can favor -- "
+                         "see COMPOSITE_WEIGHT_* constants above compute_metrics()")
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--augment", action="store_true", default=False,
                     help="apply train-only 3D augmentation (flip/rotate/intensity jitter, see augment.py)")
