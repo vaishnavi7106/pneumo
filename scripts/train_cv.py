@@ -74,20 +74,23 @@ class StatusLogger:
         self._write()
 
 
-def make_linear_probe_args(seed, patience, max_epochs):
+def make_linear_probe_args(seed, patience, max_epochs, batch_size=1, accum_steps=4, num_workers=0,
+                            air_mask_threshold=None):
     return argparse.Namespace(
-        patch_size=224, batch_size=1, accum_steps=4, amp=True,
+        patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         epochs=max_epochs, patience=patience, lr=1e-3, hidden_dim=128, dropout=0.3,
-        seed=seed, num_workers=0, selection_metric="auprc", augment=True,
+        seed=seed, num_workers=num_workers, selection_metric="auprc", augment=True,
+        air_mask_threshold=air_mask_threshold,
     )
 
 
-def make_finetune_args(seed):
+def make_finetune_args(seed, batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None):
     return argparse.Namespace(
-        unfreeze_stages=1, patch_size=224, batch_size=1, accum_steps=4, amp=True,
+        unfreeze_stages=1, patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
-        seed=seed, num_workers=0, selection_metric="auprc", time_probe_epochs=0, augment=True,
+        seed=seed, num_workers=num_workers, selection_metric="auprc", time_probe_epochs=0, augment=True,
+        air_mask_threshold=air_mask_threshold,
     )
 
 
@@ -147,7 +150,8 @@ def evaluate_fold(checkpoint_path, splits, patch_size=224):
     }
 
 
-def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed):
+def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
+                  batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None):
     fold_idx = fold["fold"]
     splits = fold["splits"]
     fold_dir = os.path.join(cv_dir, f"fold_{fold_idx}")
@@ -157,7 +161,8 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed):
     logger.update(fold_idx, "linear_probe", status="running")
 
     lp_run_dir = os.path.join(fold_dir, "linear_probe")
-    lp_args = make_linear_probe_args(seed, lp_patience, lp_max_epochs)
+    lp_args = make_linear_probe_args(seed, lp_patience, lp_max_epochs, batch_size, accum_steps,
+                                      num_workers, air_mask_threshold)
 
     def lp_progress(epoch, val_metrics):
         logger.update(fold_idx, "linear_probe", epoch=epoch, val_metrics=val_metrics, status="running")
@@ -173,7 +178,7 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed):
     logger.update(fold_idx, "fine_tune", status="running")
 
     ft_run_dir = os.path.join(fold_dir, "finetune")
-    ft_args = make_finetune_args(seed)
+    ft_args = make_finetune_args(seed, batch_size, accum_steps, num_workers, air_mask_threshold)
     lp_checkpoint = os.path.join(lp_result["ckpt_dir"], "best.pt")
 
     def ft_progress(epoch, val_metrics):
@@ -212,6 +217,17 @@ def main():
     p.add_argument("--lp-patience", type=int, default=15)
     p.add_argument("--lp-max-epochs", type=int, default=60)
     p.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "runs"))
+    p.add_argument("--batch-size", type=int, default=1,
+                    help="physical batch size for both linear-probe and fine-tune stages "
+                         "(default 1, tuned for a 12GB card; a 24GB card can go higher, e.g. 2-4)")
+    p.add_argument("--accum-steps", type=int, default=4,
+                    help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
+    p.add_argument("--num-workers", type=int, default=0,
+                    help="dataloader worker processes (0 = load in the main process)")
+    p.add_argument("--air-mask-threshold", type=float, default=None,
+                    help="if set, add a 2nd input channel: 1.0 where raw HU < threshold (inside the body "
+                         "only, see dataset.py's body-mask restriction) else 0.0, e.g. -600 for air. "
+                         "Default None = original 1-channel (intensity only).")
     args = p.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -219,7 +235,9 @@ def main():
     os.makedirs(cv_dir, exist_ok=True)
 
     logger = StatusLogger(cv_dir)
-    logger.log(f"Starting 3-fold CV run. Output dir: {cv_dir}")
+    logger.log(f"Starting {args.n_splits}-fold CV run. Output dir: {cv_dir}")
+    logger.log(f"batch_size={args.batch_size}, accum_steps={args.accum_steps}, "
+               f"num_workers={args.num_workers}, air_mask_threshold={args.air_mask_threshold}")
 
     folds = make_cv_folds(n_splits=args.n_splits, seed=args.seed)
     with open(os.path.join(cv_dir, "folds.json"), "w") as f:
@@ -231,7 +249,9 @@ def main():
         fold_idx = fold["fold"]
         t0 = time.time()
         try:
-            test_metrics = run_one_fold(fold, cv_dir, logger, args.lp_patience, args.lp_max_epochs, args.seed)
+            test_metrics = run_one_fold(fold, cv_dir, logger, args.lp_patience, args.lp_max_epochs, args.seed,
+                                         args.batch_size, args.accum_steps, args.num_workers,
+                                         args.air_mask_threshold)
             all_test_metrics.append(test_metrics)
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
