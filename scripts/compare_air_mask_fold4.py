@@ -37,23 +37,23 @@ ARMS = [
 ]
 
 
-def run_arm(arm, splits, seed, output_dir, lp_patience, lp_max_epochs):
+def run_arm(arm, splits, seed, output_dir, lp_patience, lp_max_epochs, batch_size, accum_steps, num_workers):
     air_mask_threshold = arm["air_mask_threshold"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(output_dir, f"fold4_{arm['name']}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
     lp_args = argparse.Namespace(
-        patch_size=224, batch_size=1, accum_steps=4, amp=True,
+        patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         epochs=lp_max_epochs, patience=lp_patience, lr=1e-3, hidden_dim=128, dropout=0.3,
-        seed=seed, num_workers=0, selection_metric="auprc", augment=True,
+        seed=seed, num_workers=num_workers, selection_metric="auprc", augment=True,
         air_mask_threshold=air_mask_threshold,
     )
     ft_args = argparse.Namespace(
-        unfreeze_stages=1, patch_size=224, batch_size=1, accum_steps=4, amp=True,
+        unfreeze_stages=1, patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
-        seed=seed, num_workers=0, selection_metric="auprc", time_probe_epochs=0, augment=True,
+        seed=seed, num_workers=num_workers, selection_metric="auprc", time_probe_epochs=0, augment=True,
         air_mask_threshold=air_mask_threshold,
     )
 
@@ -89,16 +89,26 @@ def main():
     p.add_argument("--lp-patience", type=int, default=15)
     p.add_argument("--lp-max-epochs", type=int, default=60)
     p.add_argument("--output-dir", type=str, default=os.path.join(ROOT, "runs"))
+    p.add_argument("--batch-size", type=int, default=1,
+                    help="physical batch size for both linear-probe and fine-tune stages "
+                         "(default 1, tuned for a 12GB card; a 24GB card can go higher, e.g. 2-4)")
+    p.add_argument("--accum-steps", type=int, default=4,
+                    help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
+    p.add_argument("--num-workers", type=int, default=0,
+                    help="dataloader worker processes (0 = load in the main process)")
     args = p.parse_args()
 
     folds = make_cv_folds(n_splits=5, seed=args.seed)
     splits = folds[4]["splits"]
     print(f"Fold 4 splits: { {k: len(v) for k, v in splits.items()} }")
+    print(f"batch_size={args.batch_size}, accum_steps={args.accum_steps} "
+          f"(effective batch={args.batch_size * args.accum_steps}), num_workers={args.num_workers}")
 
     results = {}
     for arm in ARMS:
         results[arm["name"]] = run_arm(arm, splits, args.seed, args.output_dir,
-                                        args.lp_patience, args.lp_max_epochs)
+                                        args.lp_patience, args.lp_max_epochs,
+                                        args.batch_size, args.accum_steps, args.num_workers)
 
     print(f"\n{'='*70}\n=== COMPARISON: baseline (1ch) vs. air-mask (2ch), fold 4, identical recipe ===\n{'='*70}")
     base = results["baseline_1ch"]["test_metrics"]
