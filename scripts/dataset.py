@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from scipy import ndimage
 from monai.data import MetaTensor
 from monai.transforms import Orientation, Spacing
 from torch.utils.data import DataLoader, Dataset
@@ -103,8 +104,6 @@ def _compute_body_mask(raw_hu_3d: torch.Tensor, body_threshold: float = BODY_MAS
     from being carved out (they're < body_threshold themselves, so without
     hole-filling they'd incorrectly count as "outside the body").
     """
-    from scipy import ndimage
-
     arr = raw_hu_3d.numpy()
     body_binary = arr > body_threshold
 
@@ -141,9 +140,65 @@ def _compute_body_mask(raw_hu_3d: torch.Tensor, body_threshold: float = BODY_MAS
 CACHE_DIR = os.path.join(ROOT, "cache")
 
 
+_COMPONENT_CLASSIFIER_CACHE = {}
+
+
+def _load_component_classifier(path):
+    """Lazy-loaded, cached by path -- avoids re-unpickling the model on
+    every __getitem__ call. Kept as a local import so PneumoDataset's normal
+    (non-refined) path has no hard dependency on sklearn/pickle."""
+    if path not in _COMPONENT_CLASSIFIER_CACHE:
+        import pickle
+        with open(path, "rb") as f:
+            _COMPONENT_CLASSIFIER_CACHE[path] = pickle.load(f)
+    return _COMPONENT_CLASSIFIER_CACHE[path]
+
+
+def _refine_air_mask_by_component_score(air_binary: np.ndarray, body_mask: np.ndarray, spacing,
+                                         classifier_path: str) -> np.ndarray:
+    """Stage 2 of the free-air detection cascade (see component_features.py,
+    build_component_dataset.py, train_component_classifier.py): reweights
+    each connected component of the raw stage-1 mask by the trained
+    classifier's predicted probability, rather than hard-keeping/discarding
+    it -- the classifier's held-out recall (~24%) is too low to trust as a
+    hard filter (it would throw away most real free-air components along
+    with the bowel-gas ones), so this returns a SOFT mask where each
+    component's voxels are set to its classifier probability instead of 1.0,
+    preserving low-confidence components as weak (not zero) signal.
+    """
+    from component_features import compute_component_features, crop_to_component_bbox, extract_components
+
+    bundle = _load_component_classifier(classifier_path)
+    clf, scaler, features = bundle["clf"], bundle["scaler"], bundle["features"]
+
+    labeled, kept_ids = extract_components(air_binary)
+    refined = np.zeros(air_binary.shape, dtype=np.float32)
+    if not kept_ids:
+        return refined
+
+    dist_to_outside = ndimage.distance_transform_edt(body_mask, sampling=spacing)
+    bbox_objects = ndimage.find_objects(labeled)
+
+    for cid in kept_ids:
+        padded_slice, offset = crop_to_component_bbox(labeled.shape, bbox_objects[cid - 1])
+        comp_local = labeled[padded_slice] == cid
+        body_local = body_mask[padded_slice]
+        feats = compute_component_features(comp_local, body_local, spacing, dist_to_outside, offset)
+        # DataFrame (not a bare array) so the column names match what the
+        # scaler was fit on -- avoids sklearn's "X does not have valid
+        # feature names" warning on every single component, every sample
+        x = pd.DataFrame([[feats[f] for f in features]], columns=features)
+        x_scaled = scaler.transform(x)
+        prob = float(clf.predict_proba(x_scaled)[0, 1])
+        refined[padded_slice][comp_local] = prob
+
+    return refined
+
+
 class PneumoDataset(Dataset):
     def __init__(self, filepaths, audit_csv=AUDIT_CSV, roi_bbox_csv=ROI_BBOX_CSV, patch_size=PATCH_SIZE,
-                 cache_dir=CACHE_DIR, use_cache=True, augment=False, air_mask_threshold=None):
+                 cache_dir=CACHE_DIR, use_cache=True, augment=False, air_mask_threshold=None,
+                 air_mask_classifier_path=None):
         self.filepaths = list(filepaths)
         self.patch_size = tuple(patch_size)
         self.use_cache = use_cache
@@ -157,10 +212,18 @@ class PneumoDataset(Dataset):
         # model.py's build_pretrained_encoder(in_channels=2) for how the
         # encoder's first conv is adapted to consume it.
         self.air_mask_threshold = air_mask_threshold
+        # optional stage-2 refinement: path to a pickled {"clf","scaler",
+        # "features"} bundle from train_component_classifier.py. Reweights
+        # (not hard-filters) each connected component by classifier
+        # probability -- see _refine_air_mask_by_component_score(). Only
+        # meaningful when air_mask_threshold is also set.
+        self.air_mask_classifier_path = air_mask_classifier_path
         # cache is keyed by patch_size AND channel config since the same volume
         # produces a different tensor at 128^3 vs 224^3, and a 1-channel vs
         # 2-channel (air-mask) tensor is a completely different shape/content
         channel_suffix = f"_airmask{air_mask_threshold:g}" if air_mask_threshold is not None else ""
+        if air_mask_classifier_path is not None:
+            channel_suffix += "_refined"
         self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}{channel_suffix}") if use_cache else None
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -223,7 +286,20 @@ class PneumoDataset(Dataset):
             # scanner air (also < threshold) gets flagged too, see qc_air_mask.py
             air_binary = (raw_hu_3d < self.air_mask_threshold) & (body_mask_3d > 0.5)
 
-            mask = air_binary.float().unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
+            if self.air_mask_classifier_path is not None:
+                # NOTE: the classifier was trained on NATIVE (pre-resample)
+                # anisotropic-spacing features; this applies it post-resample
+                # (isotropic RESAMPLE_SPACING) since that's where air_binary
+                # already exists in this pipeline. Features are physical-unit
+                # (mm) based so should transfer reasonably, but this is a
+                # known, accepted distribution shift for this experimental path.
+                mask_arr = _refine_air_mask_by_component_score(
+                    air_binary.numpy(), body_mask_3d.numpy().astype(bool),
+                    RESAMPLE_SPACING, self.air_mask_classifier_path,
+                )
+                mask = torch.as_tensor(mask_arr).unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
+            else:
+                mask = air_binary.float().unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
             # trilinear (not nearest) so the mask resizes with the same
             # interpolation as the intensity channel -- produces a "soft" mask
             # at patch_size resolution (values between 0/1 at former edges)
@@ -259,11 +335,12 @@ class PneumoDataset(Dataset):
 
 
 def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE,
-                      augment_train: bool = False, air_mask_threshold=None):
+                      augment_train: bool = False, air_mask_threshold=None, air_mask_classifier_path=None):
     loaders = {}
     for name, filepaths in splits.items():
         ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"),
-                            air_mask_threshold=air_mask_threshold)
+                            air_mask_threshold=air_mask_threshold,
+                            air_mask_classifier_path=air_mask_classifier_path)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             num_workers=num_workers, pin_memory=True,

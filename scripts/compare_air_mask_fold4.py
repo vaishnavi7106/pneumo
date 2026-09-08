@@ -2,14 +2,21 @@
 Controlled single-fold comparison: does adding the air-mask channel help,
 holding everything else constant?
 
-Both arms use the SAME fold-4 split (cv_split.make_cv_folds(n_splits=5,
+All arms use the SAME fold-4 split (cv_split.make_cv_folds(n_splits=5,
 seed=42)[4], identical to the 5-fold CV baseline and the earlier
 stage3+4-augmented test) and the SAME training recipe (train-only 3D
 augmentation, stage-4-only fine-tuning -- the config just pushed as
 train_cv.py's default for the 4090 run):
 
-  arm A: baseline_1ch      -- in_channels=1 (original, no air mask)
-  arm B: air_mask_2ch      -- in_channels=2, air_mask_threshold=-600 HU
+  arm A: baseline_1ch       -- in_channels=1 (original, no air mask)
+  arm B: air_mask_2ch       -- in_channels=2, raw air_mask_threshold=-600 HU
+  arm C: air_mask_refined_2ch -- in_channels=2, air mask reweighted by the
+                                 stage-2 component classifier (see
+                                 train_component_classifier.py) instead of
+                                 the raw threshold -- tests whether the
+                                 precision improvement measured at the
+                                 component level (0.074->0.204 held-out)
+                                 actually helps the downstream classifier
 
 Run sequentially (one GPU). Only the air-mask channel differs between arms,
 so any AUROC/AUPRC difference is attributable to that one change.
@@ -30,15 +37,19 @@ from train import run_linear_probe, set_all_seeds  # noqa: E402
 from train_cv import evaluate_fold  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CLASSIFIER_PATH = os.path.join(ROOT, "scripts", "component_classifier", "component_classifier.pkl")
 
 ARMS = [
-    {"name": "baseline_1ch", "air_mask_threshold": None},
-    {"name": "air_mask_2ch", "air_mask_threshold": -600.0},
+    {"name": "baseline_1ch", "air_mask_threshold": None, "air_mask_classifier_path": None},
+    {"name": "air_mask_2ch", "air_mask_threshold": -600.0, "air_mask_classifier_path": None},
+    {"name": "air_mask_refined_2ch", "air_mask_threshold": -600.0,
+     "air_mask_classifier_path": DEFAULT_CLASSIFIER_PATH},
 ]
 
 
 def run_arm(arm, splits, seed, output_dir, lp_patience, lp_max_epochs, batch_size, accum_steps, num_workers):
     air_mask_threshold = arm["air_mask_threshold"]
+    air_mask_classifier_path = arm.get("air_mask_classifier_path")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(output_dir, f"fold4_{arm['name']}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
@@ -47,14 +58,14 @@ def run_arm(arm, splits, seed, output_dir, lp_patience, lp_max_epochs, batch_siz
         patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         epochs=lp_max_epochs, patience=lp_patience, lr=1e-3, hidden_dim=128, dropout=0.3,
         seed=seed, num_workers=num_workers, selection_metric="composite", augment=True,
-        air_mask_threshold=air_mask_threshold,
+        air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
     )
     ft_args = argparse.Namespace(
         unfreeze_stages=1, patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
         seed=seed, num_workers=num_workers, selection_metric="composite", time_probe_epochs=0, augment=True,
-        air_mask_threshold=air_mask_threshold,
+        air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
     )
 
     print(f"\n{'='*70}\n=== ARM {arm['name']} (air_mask_threshold={air_mask_threshold}): linear probe ===\n{'='*70}")
@@ -110,13 +121,17 @@ def main():
                                         args.lp_patience, args.lp_max_epochs,
                                         args.batch_size, args.accum_steps, args.num_workers)
 
-    print(f"\n{'='*70}\n=== COMPARISON: baseline (1ch) vs. air-mask (2ch), fold 4, identical recipe ===\n{'='*70}")
+    print(f"\n{'='*70}\n=== COMPARISON: all arms, fold 4, identical recipe ===\n{'='*70}")
     base = results["baseline_1ch"]["test_metrics"]
-    mask = results["air_mask_2ch"]["test_metrics"]
+    arm_names = [a["name"] for a in ARMS]
     for metric in ["auroc", "auprc", "sensitivity", "specificity", "accuracy"]:
-        delta = mask[metric] - base[metric]
-        print(f"  {metric:14s}: baseline_1ch={base[metric]:.4f}  air_mask_2ch={mask[metric]:.4f}  "
-              f"delta={delta:+.4f}")
+        line = f"  {metric:14s}: " + "  ".join(
+            f"{name}={results[name]['test_metrics'][metric]:.4f}"
+            + (f" (delta={results[name]['test_metrics'][metric] - base[metric]:+.4f})"
+               if name != "baseline_1ch" else "")
+            for name in arm_names
+        )
+        print(line)
 
     summary_path = os.path.join(args.output_dir, "fold4_air_mask_comparison_summary.json")
     with open(summary_path, "w") as f:

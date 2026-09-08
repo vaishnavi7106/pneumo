@@ -322,6 +322,7 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     air_mask_threshold = getattr(args, "air_mask_threshold", None)
+    air_mask_classifier_path = getattr(args, "air_mask_classifier_path", None)
     in_channels = 2 if air_mask_threshold is not None else 1
 
     config = vars(args).copy()
@@ -329,6 +330,7 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     config["gpu_name"] = torch.cuda.get_device_name(0) if device == "cuda" else None
     config["selection_metric"] = args.selection_metric
     config["air_mask_threshold"] = air_mask_threshold
+    config["air_mask_classifier_path"] = air_mask_classifier_path
     config["in_channels"] = in_channels
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
@@ -336,11 +338,12 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
-        air_mask_threshold=air_mask_threshold,
+        air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
     )
     print({k: len(v) for k, v in splits.items()})
     if air_mask_threshold is not None:
-        print(f"Air-mask channel ENABLED: threshold={air_mask_threshold} HU, in_channels=2")
+        refined_note = " (refined by stage-2 component classifier)" if air_mask_classifier_path else ""
+        print(f"Air-mask channel ENABLED: threshold={air_mask_threshold} HU, in_channels=2{refined_note}")
 
     # class imbalance in the train split: weight the positive class by neg/pos
     # ratio so BCEWithLogitsLoss doesn't let the model collapse to predicting
@@ -491,6 +494,11 @@ def parse_args():
     p.add_argument("--air-mask-threshold", type=float, default=None,
                     help="if set, add a 2nd input channel: 1.0 where raw HU < threshold else 0.0 "
                          "(e.g. -600 for air). Default None = original 1-channel (intensity only).")
+    p.add_argument("--air-mask-classifier-path", type=str, default=None,
+                    help="optional stage-2 refinement: path to a pickled component classifier "
+                         "(from train_component_classifier.py) that reweights the air-mask channel "
+                         "by per-component probability instead of a raw threshold. Only meaningful "
+                         "when --air-mask-threshold is also set.")
     return p.parse_args()
 
 

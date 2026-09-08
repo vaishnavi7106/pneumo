@@ -77,7 +77,8 @@ def build_finetune_optimizer(model: VistaClassifier, encoder_lr: float, head_lr:
 
 
 def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str,
-                          expected_air_mask_threshold=None) -> VistaClassifier:
+                          expected_air_mask_threshold=None, expected_air_mask_classifier_path=None
+                          ) -> VistaClassifier:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     src_config = ckpt.get("config", {})
     hidden_dim = src_config.get("hidden_dim", 128)
@@ -91,6 +92,14 @@ def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str,
     assert src_air_mask_threshold == expected_air_mask_threshold, (
         f"air_mask_threshold mismatch: source checkpoint was trained with "
         f"{src_air_mask_threshold!r}, but this run was asked for {expected_air_mask_threshold!r}"
+    )
+    # same idea for the stage-2 refinement -- doesn't change in_channels (so
+    # wouldn't crash on a shape mismatch) but would silently fine-tune on
+    # differently-computed mask content than the linear probe learned from
+    src_air_mask_classifier_path = src_config.get("air_mask_classifier_path")
+    assert src_air_mask_classifier_path == expected_air_mask_classifier_path, (
+        f"air_mask_classifier_path mismatch: source checkpoint was trained with "
+        f"{src_air_mask_classifier_path!r}, but this run was asked for {expected_air_mask_classifier_path!r}"
     )
 
     model = VistaClassifier(freeze_encoder=True, hidden_dim=hidden_dim, dropout=dropout,
@@ -127,10 +136,11 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
 
     air_mask_threshold = getattr(args, "air_mask_threshold", None)
+    air_mask_classifier_path = getattr(args, "air_mask_classifier_path", None)
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
-        air_mask_threshold=air_mask_threshold,
+        air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
     )
     print({k: len(v) for k, v in splits.items()})
 
@@ -142,7 +152,8 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     print(f"Train split class balance: {n_pos} positive, {n_neg} negative -> pos_weight={pos_weight_value:.4f}")
 
     model, src_ckpt = load_from_checkpoint(checkpoint_path, unfreeze_stages, device,
-                                            expected_air_mask_threshold=air_mask_threshold)
+                                            expected_air_mask_threshold=air_mask_threshold,
+                                            expected_air_mask_classifier_path=air_mask_classifier_path)
     optimizer = build_finetune_optimizer(model, args.encoder_lr, args.head_lr)
     scaler = torch.amp.GradScaler(device="cuda", enabled=(args.amp and device == "cuda"))
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
@@ -381,6 +392,8 @@ def parse_args():
     p.add_argument("--air-mask-threshold", type=float, default=None,
                     help="must match the source linear-probe checkpoint's setting -- if it was trained "
                          "with a 2nd air-mask channel, this run must use the same threshold")
+    p.add_argument("--air-mask-classifier-path", type=str, default=None,
+                    help="must match the source linear-probe checkpoint's setting")
     return p.parse_args()
 
 
