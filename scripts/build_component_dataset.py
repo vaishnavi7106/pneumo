@@ -23,10 +23,11 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
+from scipy import ndimage
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from component_features import compute_component_features, extract_components  # noqa: E402
+from component_features import compute_component_features, crop_to_component_bbox, extract_components  # noqa: E402
 from dataset import BODY_MASK_HU_THRESHOLD  # noqa: E402
 from eval_air_mask_vs_gt import compute_body_mask  # noqa: E402
 
@@ -87,12 +88,30 @@ def main():
                                        CLOSING_ITERS, ERODE_ITERS).numpy().astype(bool)
         air_mask = (raw_hu < AIR_THRESHOLD) & body_mask
 
+        # computed ONCE per volume, not per component -- a full-volume EDT on
+        # a native ~512x512x72 array is expensive; doing it per-component
+        # (dozens of times per volume) was the actual bottleneck
+        dist_to_outside = ndimage.distance_transform_edt(body_mask, sampling=spacing)
+
         labeled, kept_ids = extract_components(air_mask)
+        # one pass over the labeled array gets every component's bounding
+        # box at once; everything per-component below then operates on a
+        # small CROPPED region, not the full ~512x512x72 array -- doing
+        # `labeled == cid` / mask & gt / argwhere / binary_dilation on the
+        # full array per component (dozens per volume) was measured at
+        # ~140-200ms EACH, making one volume take 20-30+ seconds
+        bbox_objects = ndimage.find_objects(labeled)
+
         n_pos, n_neg = 0, 0
         for cid in kept_ids:
-            comp_mask = labeled == cid
-            overlaps_gt = bool((comp_mask & gt).any())
-            feats = compute_component_features(comp_mask, body_mask, spacing)
+            padded_slice, global_offset = crop_to_component_bbox(labeled.shape, bbox_objects[cid - 1])
+            comp_local = labeled[padded_slice] == cid
+            body_local = body_mask[padded_slice]
+            gt_local = gt[padded_slice]
+
+            overlaps_gt = bool((comp_local & gt_local).any())
+            feats = compute_component_features(comp_local, body_local, spacing, dist_to_outside,
+                                                global_offset)
             feats.update({"filename": fname, "fold": volume_to_fold[fname],
                           "component_id": int(cid), "label": int(overlaps_gt)})
             rows.append(feats)

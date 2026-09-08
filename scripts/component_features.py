@@ -30,15 +30,54 @@ def extract_components(air_mask: np.ndarray, min_voxels: int = MIN_COMPONENT_VOX
     return labeled, kept_ids
 
 
-def compute_component_features(component_mask: np.ndarray, body_mask: np.ndarray, spacing) -> dict:
-    """component_mask, body_mask: same-shape boolean 3D arrays.
-    spacing: (sx, sy, sz) mm per voxel (native, possibly anisotropic)."""
+def crop_to_component_bbox(full_shape, bbox_slice, crop_pad: int = 1):
+    """Pad a component's bounding box (e.g. from ndimage.find_objects) by
+    crop_pad voxels (needed for 6-connectivity dilation correctness at the
+    boundary) and clip to the volume's bounds. Returns (padded_slice,
+    global_offset) -- global_offset is padded_slice's [0,0,0] in full-volume
+    voxel coordinates, needed to translate local coords back to global."""
+    padded_slice = tuple(
+        slice(max(0, s.start - crop_pad), min(full_shape[ax], s.stop + crop_pad))
+        for ax, s in enumerate(bbox_slice)
+    )
+    global_offset = np.array([s.start for s in padded_slice], dtype=np.float64)
+    return padded_slice, global_offset
+
+
+def compute_component_features(component_mask_local: np.ndarray, body_mask_local: np.ndarray, spacing,
+                                dist_to_outside_global: np.ndarray, global_offset=(0.0, 0.0, 0.0)) -> dict:
+    """component_mask_local, body_mask_local: boolean 3D arrays ALREADY
+    CROPPED by the caller to (a padded version of) the component's bounding
+    box -- see crop_to_component_bbox(). Operating on small local arrays
+    instead of the full native volume (~512x512x72) is what makes this fast;
+    doing the equivalent full-array ops per component (argwhere,
+    binary_dilation, plus the caller's own `labeled == cid` mask extraction)
+    was measured at ~140-200ms/component, making a ~150-component volume
+    take 20-30+ seconds. Cropped, the whole volume's components finish in a
+    fraction of a second.
+
+    spacing: (sx, sy, sz) mm per voxel (native, possibly anisotropic).
+    dist_to_outside_global: precomputed ndimage.distance_transform_edt(body_mask,
+    sampling=spacing) for the WHOLE volume -- shared across all components
+    from the same volume (expensive, identical every time). Only a single
+    point is indexed from it here, translated via global_offset, so it does
+    NOT need cropping itself.
+    global_offset: padded_slice's [0,0,0] in full-volume voxel coordinates
+    (from crop_to_component_bbox), used to translate local centroid ->
+    global coordinates for the dist_to_outside_global lookup.
+    """
     spacing = np.asarray(spacing, dtype=np.float64)
+    global_offset = np.asarray(global_offset, dtype=np.float64)
     voxel_volume_mm3 = float(np.prod(spacing))
-    n_voxels = int(component_mask.sum())
+
+    comp_local = component_mask_local
+    body_local = body_mask_local
+
+    n_voxels = int(comp_local.sum())
     volume_ml = n_voxels * voxel_volume_mm3 / 1000.0
 
-    coords_vox = np.argwhere(component_mask).astype(np.float64)
+    coords_vox_local = np.argwhere(comp_local).astype(np.float64)
+    coords_vox = coords_vox_local + global_offset[None, :]  # back to full-volume voxel coords
     coords_mm = coords_vox * spacing[None, :]
     centroid_mm = coords_mm.mean(axis=0)
     centroid_vox = coords_vox.mean(axis=0)
@@ -63,16 +102,15 @@ def compute_component_features(component_mask: np.ndarray, body_mask: np.ndarray
     # neighbor outside the body (body_mask == 0) -- proxies "hugging the
     # abdominal wall" vs. sitting deep in the interior (e.g. gastric bubble)
     struct6 = ndimage.generate_binary_structure(3, 1)
-    dilated_bg = ndimage.binary_dilation(~body_mask, structure=struct6)
-    wall_contact_voxels = int((component_mask & dilated_bg).sum())
+    dilated_bg_local = ndimage.binary_dilation(~body_local, structure=struct6)
+    wall_contact_voxels = int((comp_local & dilated_bg_local).sum())
     wall_contact_fraction = wall_contact_voxels / n_voxels if n_voxels > 0 else 0.0
 
     # centroid-to-wall distance (mm): reuses the same distance-transform
     # approach as qc_air_mask_extended.py's centrality_score, but at the
     # component centroid specifically (one number per component)
-    dist_to_outside = ndimage.distance_transform_edt(body_mask, sampling=spacing)
-    cv = np.clip(np.round(centroid_vox).astype(int), 0, np.array(body_mask.shape) - 1)
-    centroid_wall_distance_mm = float(dist_to_outside[cv[0], cv[1], cv[2]])
+    cv = np.clip(np.round(centroid_vox).astype(int), 0, np.array(dist_to_outside_global.shape) - 1)
+    centroid_wall_distance_mm = float(dist_to_outside_global[cv[0], cv[1], cv[2]])
 
     # compactness: volume / bounding-box volume, in physical mm^3 -- a
     # simple proxy for sphericity that avoids needing marching-cubes surface
