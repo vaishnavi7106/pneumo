@@ -75,22 +75,23 @@ class StatusLogger:
 
 
 def make_linear_probe_args(seed, patience, max_epochs, batch_size=1, accum_steps=4, num_workers=0,
-                            air_mask_threshold=None):
+                            air_mask_threshold=None, augment=True):
     return argparse.Namespace(
         patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         epochs=max_epochs, patience=patience, lr=1e-3, hidden_dim=128, dropout=0.3,
-        seed=seed, num_workers=num_workers, selection_metric="composite", augment=True,
+        seed=seed, num_workers=num_workers, selection_metric="composite", augment=augment,
         air_mask_threshold=air_mask_threshold,
     )
 
 
-def make_finetune_args(seed, batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None):
+def make_finetune_args(seed, batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None,
+                        augment=True):
     return argparse.Namespace(
         unfreeze_stages=1, patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
-        seed=seed, num_workers=num_workers, selection_metric="composite", time_probe_epochs=0, augment=True,
-        air_mask_threshold=air_mask_threshold,
+        seed=seed, num_workers=num_workers, selection_metric="composite", time_probe_epochs=0,
+        augment=augment, air_mask_threshold=air_mask_threshold,
     )
 
 
@@ -151,7 +152,7 @@ def evaluate_fold(checkpoint_path, splits, patch_size=224):
 
 
 def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
-                  batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None):
+                  batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None, augment=True):
     fold_idx = fold["fold"]
     splits = fold["splits"]
     fold_dir = os.path.join(cv_dir, f"fold_{fold_idx}")
@@ -162,7 +163,7 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
 
     lp_run_dir = os.path.join(fold_dir, "linear_probe")
     lp_args = make_linear_probe_args(seed, lp_patience, lp_max_epochs, batch_size, accum_steps,
-                                      num_workers, air_mask_threshold)
+                                      num_workers, air_mask_threshold, augment)
 
     def lp_progress(epoch, val_metrics):
         logger.update(fold_idx, "linear_probe", epoch=epoch, val_metrics=val_metrics, status="running")
@@ -178,7 +179,7 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
     logger.update(fold_idx, "fine_tune", status="running")
 
     ft_run_dir = os.path.join(fold_dir, "finetune")
-    ft_args = make_finetune_args(seed, batch_size, accum_steps, num_workers, air_mask_threshold)
+    ft_args = make_finetune_args(seed, batch_size, accum_steps, num_workers, air_mask_threshold, augment)
     lp_checkpoint = os.path.join(lp_result["ckpt_dir"], "best.pt")
 
     def ft_progress(epoch, val_metrics):
@@ -228,6 +229,11 @@ def main():
                     help="if set, add a 2nd input channel: 1.0 where raw HU < threshold (inside the body "
                          "only, see dataset.py's body-mask restriction) else 0.0, e.g. -600 for air. "
                          "Default None = original 1-channel (intensity only).")
+    p.add_argument("--augment", action="store_true", default=True,
+                    help="apply train-only 3D augmentation (flip/rotate/intensity jitter). Default on.")
+    p.add_argument("--no-augment", dest="augment", action="store_false",
+                    help="disable augmentation -- use to isolate the air-mask channel's effect from "
+                         "augmentation's effect (they were previously only ever tested together)")
     args = p.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -237,7 +243,8 @@ def main():
     logger = StatusLogger(cv_dir)
     logger.log(f"Starting {args.n_splits}-fold CV run. Output dir: {cv_dir}")
     logger.log(f"batch_size={args.batch_size}, accum_steps={args.accum_steps}, "
-               f"num_workers={args.num_workers}, air_mask_threshold={args.air_mask_threshold}")
+               f"num_workers={args.num_workers}, air_mask_threshold={args.air_mask_threshold}, "
+               f"augment={args.augment}")
 
     folds = make_cv_folds(n_splits=args.n_splits, seed=args.seed)
     with open(os.path.join(cv_dir, "folds.json"), "w") as f:
@@ -251,7 +258,7 @@ def main():
         try:
             test_metrics = run_one_fold(fold, cv_dir, logger, args.lp_patience, args.lp_max_epochs, args.seed,
                                          args.batch_size, args.accum_steps, args.num_workers,
-                                         args.air_mask_threshold)
+                                         args.air_mask_threshold, args.augment)
             all_test_metrics.append(test_metrics)
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
