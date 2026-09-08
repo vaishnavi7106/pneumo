@@ -23,6 +23,7 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from component_features import compute_component_features, extract_components  # noqa: E402
@@ -72,7 +73,9 @@ def main():
     print(f"  holdout: {split['holdout']}\n")
 
     rows = []
-    for i, fname in enumerate(gt_files):
+    pbar = tqdm(gt_files, desc="volumes", unit="vol", file=sys.stdout)
+    for fname in pbar:
+        pbar.set_postfix_str(fname)
         ct_path = os.path.join(CT_DIR, fname)
         gt_path = os.path.join(GT_DIR, fname)
         img = nib.load(ct_path)
@@ -95,8 +98,8 @@ def main():
             rows.append(feats)
             n_pos += int(overlaps_gt)
             n_neg += int(not overlaps_gt)
-        print(f"[{i+1:2d}/{len(gt_files)}] {fname} ({volume_to_fold[fname]:>7s}): "
-              f"{len(kept_ids)} components -> {n_pos} positive, {n_neg} negative", flush=True)
+        tqdm.write(f"{fname} ({volume_to_fold[fname]:>7s}): "
+                   f"{len(kept_ids)} components -> {n_pos} positive, {n_neg} negative")
 
     df = pd.DataFrame(rows)
     out_csv = os.path.join(OUT_DIR, "component_dataset.csv")
