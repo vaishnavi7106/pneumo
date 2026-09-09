@@ -104,7 +104,8 @@ def get_probs_for_files(checkpoint_path, filepaths, patch_size=224):
 
     ds = PneumoDataset(filepaths, patch_size=(patch_size,) * 3,
                         air_mask_threshold=config.get("air_mask_threshold"),
-                        air_mask_classifier_path=config.get("air_mask_classifier_path"))
+                        air_mask_classifier_path=config.get("air_mask_classifier_path"),
+                        boundary_distance_channel=config.get("boundary_distance_channel", False))
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     model = VistaClassifier(freeze_encoder=True, hidden_dim=config.get("hidden_dim", 128),

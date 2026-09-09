@@ -195,10 +195,35 @@ def _refine_air_mask_by_component_score(air_binary: np.ndarray, body_mask: np.nd
     return refined
 
 
+# cap for the boundary-distance channel, in mm, before normalizing to [0,1] --
+# distance-to-wall saturates well below this for any voxel that matters (an
+# adult abdomen cross-section is at most ~200-250mm across), so voxels near
+# the volume's own center just clip to 1.0 rather than needing a per-volume
+# max (which would make the channel's scale inconsistent across volumes).
+BOUNDARY_DISTANCE_CAP_MM = 150.0
+
+
+def _compute_boundary_distance_channel(raw_hu_3d: torch.Tensor, spacing) -> torch.Tensor:
+    """Alternative to the air-mask channel: instead of a hard (or classifier-
+    refined) air/no-air decision, gives the model a smooth geometric prior --
+    each voxel's physical distance (mm) to the outside-body boundary,
+    normalized to [0,1]. No thresholding of HU at all; the density channel
+    already carries that information, and the CNN can learn its own
+    density-near-boundary association instead of us hand-picking one. See
+    session discussion: the air-mask channel (raw or classifier-refined) is
+    fundamentally limited by density alone not separating free air from bowel
+    gas -- this tests whether a non-binary positional prior fares better.
+    """
+    body_mask_3d = _compute_body_mask(raw_hu_3d)
+    dist = ndimage.distance_transform_edt(body_mask_3d.numpy().astype(bool), sampling=spacing)
+    dist = np.clip(dist, 0.0, BOUNDARY_DISTANCE_CAP_MM) / BOUNDARY_DISTANCE_CAP_MM
+    return torch.as_tensor(dist, dtype=torch.float32)
+
+
 class PneumoDataset(Dataset):
     def __init__(self, filepaths, audit_csv=AUDIT_CSV, roi_bbox_csv=ROI_BBOX_CSV, patch_size=PATCH_SIZE,
                  cache_dir=CACHE_DIR, use_cache=True, augment=False, air_mask_threshold=None,
-                 air_mask_classifier_path=None):
+                 air_mask_classifier_path=None, boundary_distance_channel=False):
         self.filepaths = list(filepaths)
         self.patch_size = tuple(patch_size)
         self.use_cache = use_cache
@@ -218,12 +243,22 @@ class PneumoDataset(Dataset):
         # probability -- see _refine_air_mask_by_component_score(). Only
         # meaningful when air_mask_threshold is also set.
         self.air_mask_classifier_path = air_mask_classifier_path
+        # alternative aux channel, mutually exclusive with air_mask_threshold
+        # in practice (see _preprocess) -- a smooth boundary-distance prior
+        # instead of a thresholded/refined air mask
+        self.boundary_distance_channel = boundary_distance_channel
+        assert not (air_mask_threshold is not None and boundary_distance_channel), (
+            "air_mask_threshold and boundary_distance_channel are alternative aux channels -- "
+            "pick one, not both"
+        )
         # cache is keyed by patch_size AND channel config since the same volume
         # produces a different tensor at 128^3 vs 224^3, and a 1-channel vs
         # 2-channel (air-mask) tensor is a completely different shape/content
         channel_suffix = f"_airmask{air_mask_threshold:g}" if air_mask_threshold is not None else ""
         if air_mask_classifier_path is not None:
             channel_suffix += "_refined"
+        if boundary_distance_channel:
+            channel_suffix += "_boundarydist"
         self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}{channel_suffix}") if use_cache else None
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -307,6 +342,14 @@ class PneumoDataset(Dataset):
             mask = mask.squeeze(0)  # [1, *patch_size]
             x = torch.cat([x, mask], dim=0)  # [2, *patch_size]
 
+        if self.boundary_distance_channel:
+            raw_hu_3d = raw_hu.squeeze(0)  # [X, Y, Z]
+            dist = _compute_boundary_distance_channel(raw_hu_3d, RESAMPLE_SPACING)
+            dist = dist.unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
+            dist = F.interpolate(dist, size=self.patch_size, mode="trilinear", align_corners=False)
+            dist = dist.squeeze(0)  # [1, *patch_size]
+            x = torch.cat([x, dist], dim=0)  # [2, *patch_size]
+
         return x
 
     def __getitem__(self, idx):
@@ -335,12 +378,14 @@ class PneumoDataset(Dataset):
 
 
 def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE,
-                      augment_train: bool = False, air_mask_threshold=None, air_mask_classifier_path=None):
+                      augment_train: bool = False, air_mask_threshold=None, air_mask_classifier_path=None,
+                      boundary_distance_channel=False):
     loaders = {}
     for name, filepaths in splits.items():
         ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"),
                             air_mask_threshold=air_mask_threshold,
-                            air_mask_classifier_path=air_mask_classifier_path)
+                            air_mask_classifier_path=air_mask_classifier_path,
+                            boundary_distance_channel=boundary_distance_channel)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             num_workers=num_workers, pin_memory=True,

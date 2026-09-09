@@ -323,7 +323,8 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
 
     air_mask_threshold = getattr(args, "air_mask_threshold", None)
     air_mask_classifier_path = getattr(args, "air_mask_classifier_path", None)
-    in_channels = 2 if air_mask_threshold is not None else 1
+    boundary_distance_channel = getattr(args, "boundary_distance_channel", False)
+    in_channels = 2 if (air_mask_threshold is not None or boundary_distance_channel) else 1
 
     config = vars(args).copy()
     config["device"] = device
@@ -331,6 +332,7 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     config["selection_metric"] = args.selection_metric
     config["air_mask_threshold"] = air_mask_threshold
     config["air_mask_classifier_path"] = air_mask_classifier_path
+    config["boundary_distance_channel"] = boundary_distance_channel
     config["in_channels"] = in_channels
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
@@ -339,11 +341,14 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
         air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
+        boundary_distance_channel=boundary_distance_channel,
     )
     print({k: len(v) for k, v in splits.items()})
     if air_mask_threshold is not None:
         refined_note = " (refined by stage-2 component classifier)" if air_mask_classifier_path else ""
         print(f"Air-mask channel ENABLED: threshold={air_mask_threshold} HU, in_channels=2{refined_note}")
+    if boundary_distance_channel:
+        print("Boundary-distance channel ENABLED: in_channels=2")
 
     # class imbalance in the train split: weight the positive class by neg/pos
     # ratio so BCEWithLogitsLoss doesn't let the model collapse to predicting
@@ -499,6 +504,10 @@ def parse_args():
                          "(from train_component_classifier.py) that reweights the air-mask channel "
                          "by per-component probability instead of a raw threshold. Only meaningful "
                          "when --air-mask-threshold is also set.")
+    p.add_argument("--boundary-distance-channel", action="store_true", default=False,
+                    help="alternative aux channel to --air-mask-threshold: a smooth, unthresholded "
+                         "physical distance-to-body-boundary field (mm, normalized to [0,1]) instead "
+                         "of a binary/refined air mask. Mutually exclusive with --air-mask-threshold.")
     return p.parse_args()
 
 
