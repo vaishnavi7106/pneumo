@@ -75,23 +75,25 @@ class StatusLogger:
 
 
 def make_linear_probe_args(seed, patience, max_epochs, batch_size=1, accum_steps=4, num_workers=0,
-                            air_mask_threshold=None, augment=True):
+                            air_mask_threshold=None, augment=True, fixed_fov=False, roi_bbox_csv=None,
+                            patch_size=224):
     return argparse.Namespace(
-        patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
+        patch_size=patch_size, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         epochs=max_epochs, patience=patience, lr=1e-3, hidden_dim=128, dropout=0.3,
         seed=seed, num_workers=num_workers, selection_metric="composite", augment=augment,
-        air_mask_threshold=air_mask_threshold,
+        air_mask_threshold=air_mask_threshold, fixed_fov=fixed_fov, roi_bbox_csv=roi_bbox_csv,
     )
 
 
 def make_finetune_args(seed, batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None,
-                        augment=True):
+                        augment=True, fixed_fov=False, roi_bbox_csv=None, patch_size=224):
     return argparse.Namespace(
-        unfreeze_stages=1, patch_size=224, batch_size=batch_size, accum_steps=accum_steps, amp=True,
+        unfreeze_stages=1, patch_size=patch_size, batch_size=batch_size, accum_steps=accum_steps, amp=True,
         max_epochs=50, patience=15, encoder_lr=1e-5, head_lr=1e-3,
         warmup_epochs=2, warmup_start_lr=0.0, lr_decay_epochs=22, lr_min_frac=0.1,
         seed=seed, num_workers=num_workers, selection_metric="composite", time_probe_epochs=0,
-        augment=augment, air_mask_threshold=air_mask_threshold,
+        augment=augment, air_mask_threshold=air_mask_threshold, fixed_fov=fixed_fov,
+        roi_bbox_csv=roi_bbox_csv,
     )
 
 
@@ -156,7 +158,8 @@ def evaluate_fold(checkpoint_path, splits, patch_size=224):
 
 
 def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
-                  batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None, augment=True):
+                  batch_size=1, accum_steps=4, num_workers=0, air_mask_threshold=None, augment=True,
+                  fixed_fov=False, roi_bbox_csv=None, patch_size=224):
     fold_idx = fold["fold"]
     splits = fold["splits"]
     fold_dir = os.path.join(cv_dir, f"fold_{fold_idx}")
@@ -167,7 +170,8 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
 
     lp_run_dir = os.path.join(fold_dir, "linear_probe")
     lp_args = make_linear_probe_args(seed, lp_patience, lp_max_epochs, batch_size, accum_steps,
-                                      num_workers, air_mask_threshold, augment)
+                                      num_workers, air_mask_threshold, augment,
+                                      fixed_fov, roi_bbox_csv, patch_size)
 
     def lp_progress(epoch, val_metrics):
         logger.update(fold_idx, "linear_probe", epoch=epoch, val_metrics=val_metrics, status="running")
@@ -183,7 +187,8 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
     logger.update(fold_idx, "fine_tune", status="running")
 
     ft_run_dir = os.path.join(fold_dir, "finetune")
-    ft_args = make_finetune_args(seed, batch_size, accum_steps, num_workers, air_mask_threshold, augment)
+    ft_args = make_finetune_args(seed, batch_size, accum_steps, num_workers, air_mask_threshold, augment,
+                                  fixed_fov, roi_bbox_csv, patch_size)
     lp_checkpoint = os.path.join(lp_result["ckpt_dir"], "best.pt")
 
     def ft_progress(epoch, val_metrics):
@@ -199,7 +204,7 @@ def run_one_fold(fold, cv_dir, logger, lp_patience, lp_max_epochs, seed,
     logger.update(fold_idx, "evaluate", status="running")
 
     ft_checkpoint = os.path.join(ft_result["ckpt_dir"], "best.pt")
-    test_metrics = evaluate_fold(ft_checkpoint, splits)
+    test_metrics = evaluate_fold(ft_checkpoint, splits, patch_size=patch_size)
 
     logger.log(f"=== FOLD {fold_idx}: test results -- AUROC={test_metrics['auroc']:.4f} "
                f"AUPRC={test_metrics['auprc']:.4f} sens={test_metrics['sensitivity']:.4f} "
@@ -238,6 +243,17 @@ def main():
     p.add_argument("--no-augment", dest="augment", action="store_false",
                     help="disable augmentation -- use to isolate the air-mask channel's effect from "
                          "augmentation's effect (they were previously only ever tested together)")
+    p.add_argument("--fixed-fov", action="store_true", default=False,
+                    help="use the fixed-FOV preprocessing path (adaptive_roi_crop.py + constant "
+                         "3mm/voxel spacing, pad/crop instead of resize) instead of the default "
+                         "resize-based path. Pair with --roi-bbox-csv roi_bboxes_adaptive.csv and "
+                         "--patch-size 224.")
+    p.add_argument("--roi-bbox-csv", type=str, default=None,
+                    help="override the ROI bbox CSV dataset.py reads (default: roi_bboxes.csv). "
+                         "Use scripts/roi_bboxes_adaptive.csv together with --fixed-fov.")
+    p.add_argument("--patch-size", type=int, default=224,
+                    help="cubic patch size for both linear-probe and fine-tune stages. Default 224 "
+                         "matches dataset.py's FIXED_FOV_PATCH_SIZE.")
     args = p.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -248,7 +264,8 @@ def main():
     logger.log(f"Starting {args.n_splits}-fold CV run. Output dir: {cv_dir}")
     logger.log(f"batch_size={args.batch_size}, accum_steps={args.accum_steps}, "
                f"num_workers={args.num_workers}, air_mask_threshold={args.air_mask_threshold}, "
-               f"augment={args.augment}")
+               f"augment={args.augment}, fixed_fov={args.fixed_fov}, roi_bbox_csv={args.roi_bbox_csv}, "
+               f"patch_size={args.patch_size}")
 
     folds = make_cv_folds(n_splits=args.n_splits, seed=args.seed)
     with open(os.path.join(cv_dir, "folds.json"), "w") as f:
@@ -262,7 +279,8 @@ def main():
         try:
             test_metrics = run_one_fold(fold, cv_dir, logger, args.lp_patience, args.lp_max_epochs, args.seed,
                                          args.batch_size, args.accum_steps, args.num_workers,
-                                         args.air_mask_threshold, args.augment)
+                                         args.air_mask_threshold, args.augment,
+                                         args.fixed_fov, args.roi_bbox_csv, args.patch_size)
             all_test_metrics.append(test_metrics)
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
