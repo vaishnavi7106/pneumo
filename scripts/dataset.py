@@ -62,14 +62,71 @@ BODY_MASK_HU_THRESHOLD = -500.0
 # 1.5mm isotropic resample spacing.
 BODY_MASK_CLOSING_ITERATIONS = 3
 
+# --- fixed-FOV (pad/crop, no compressive resize) preprocessing path ---
+# Motivation: the adaptive ROI crop (adaptive_roi_crop.py) fixes the old
+# fixed-z-window's real-signal clipping (confirmed 0/23 GT loss), but it
+# does NOT by itself fix the shortcut-learning risk the z-window originally
+# existed to prevent -- resizing (F.interpolate) a variable physical extent
+# into a constant voxel grid means mm/voxel scales with scan extent, so the
+# model can trivially learn "more compression = extended-FOV protocol"
+# regardless of pathology. Capping the crop's physical size to fix that (see
+# adaptive_roi_crop.cap_z_extent) reintroduced clipping almost as bad as the
+# original design (18/23 GT cases affected at a 280mm cap) -- confirmed this
+# session -- so the fix is applied here instead, at the LAST preprocessing
+# step: keep mm/voxel CONSTANT for every case (no resize) by padding a
+# smaller volume up to a fixed voxel grid with a constant background value,
+# and only cropping (never resizing) when a case's extent exceeds the grid,
+# biased to preserve the superior end in z (where free air collects).
+# Coarser than RESAMPLE_SPACING (1.5mm) since the adaptive crop's physical
+# extents run several hundred mm -- covering that at 1.5mm/voxel would need
+# a voxel grid too large for available GPU memory.
+FIXED_FOV_SPACING = (3.0, 3.0, 3.0)
+# 672mm coverage per axis at 3.0mm/voxel -- sized from the REAL adaptive-crop
+# extent distribution across all 333 extended-FOV volumes
+# (roi_bboxes_adaptive.csv): x up to 496mm, y up to 410mm, z up to 685mm
+# (median z alone is 520mm -- a full torso scan has real tissue at nearly
+# every z-slice, see adaptive_roi_crop.py's docstring). At 224^3 only 1/333
+# volumes (0.3%) still exceeds this in z, by 13mm -- everything else fits
+# with zero truncation. A smaller grid (e.g. 160^3, covers only 480mm)
+# truncated z on 77.5% of volumes -- checked and rejected.
+FIXED_FOV_PATCH_SIZE = (224, 224, 224)
 
-def _load_reoriented_resampled(filepath: str) -> MetaTensor:
+
+def _pad_or_crop_to_size(x: torch.Tensor, target_size, pad_value: float = 0.0, bias_high_axis=None):
+    """x: [C, X, Y, Z]. Returns [C, *target_size] via padding/cropping ONLY
+    (no interpolation) -- preserves whatever physical mm/voxel scale was
+    established at resample time, regardless of this volume's own extent.
+    Smaller-than-target axes are centered and padded with pad_value on both
+    sides; larger-than-target axes are cropped -- centered, UNLESS
+    bias_high_axis names that axis, in which case the HIGH-index end is kept
+    (crop only from the low end) -- used for z, since real free-air signal
+    is more likely to extend inferior than to be cut off at the superior end.
+    """
+    c = x.shape[0]
+    cur = x.shape[1:]
+    out = torch.full((c, *target_size), pad_value, dtype=x.dtype)
+    src_slices, dst_slices = [], []
+    for axis, (cur_s, tgt_s) in enumerate(zip(cur, target_size)):
+        if cur_s <= tgt_s:
+            pad_lo = (tgt_s - cur_s) // 2
+            src_slices.append(slice(0, cur_s))
+            dst_slices.append(slice(pad_lo, pad_lo + cur_s))
+        else:
+            crop_total = cur_s - tgt_s
+            crop_lo = crop_total if bias_high_axis == axis else crop_total // 2
+            src_slices.append(slice(crop_lo, crop_lo + tgt_s))
+            dst_slices.append(slice(0, tgt_s))
+    out[:, dst_slices[0], dst_slices[1], dst_slices[2]] = x[:, src_slices[0], src_slices[1], src_slices[2]]
+    return out
+
+
+def _load_reoriented_resampled(filepath: str, spacing=RESAMPLE_SPACING) -> MetaTensor:
     img = nib.load(filepath)
     data = img.get_fdata(dtype=np.float32)[None]
     affine = torch.as_tensor(img.affine, dtype=torch.float64)
     data = MetaTensor(torch.as_tensor(data, dtype=torch.float32), affine=affine)
     data = Orientation(axcodes="RAS")(data)
-    data = Spacing(pixdim=RESAMPLE_SPACING, mode="bilinear")(data)
+    data = Spacing(pixdim=spacing, mode="bilinear")(data)
     return data
 
 
@@ -223,10 +280,19 @@ def _compute_boundary_distance_channel(raw_hu_3d: torch.Tensor, spacing) -> torc
 class PneumoDataset(Dataset):
     def __init__(self, filepaths, audit_csv=AUDIT_CSV, roi_bbox_csv=ROI_BBOX_CSV, patch_size=PATCH_SIZE,
                  cache_dir=CACHE_DIR, use_cache=True, augment=False, air_mask_threshold=None,
-                 air_mask_classifier_path=None, boundary_distance_channel=False):
+                 air_mask_classifier_path=None, boundary_distance_channel=False, fixed_fov=False,
+                 fixed_fov_spacing=FIXED_FOV_SPACING):
         self.filepaths = list(filepaths)
         self.patch_size = tuple(patch_size)
         self.use_cache = use_cache
+        # fixed-FOV mode: pad/crop instead of resize (see _pad_or_crop_to_size
+        # and the FIXED_FOV_* constants above) -- keeps mm/voxel constant
+        # across all cases, avoiding the resize-compression shortcut-learning
+        # signal the adaptive ROI crop otherwise reintroduces. Uses a coarser
+        # resample spacing than the default 1.5mm since adaptive-cropped
+        # extents run several hundred mm.
+        self.fixed_fov = fixed_fov
+        self.fixed_fov_spacing = tuple(fixed_fov_spacing)
         # train-only stochastic augmentation, applied AFTER cache load (see
         # augment.py) -- never set True for val/test, or metrics would be
         # measured against a moving target instead of a fixed evaluation set
@@ -259,6 +325,8 @@ class PneumoDataset(Dataset):
             channel_suffix += "_refined"
         if boundary_distance_channel:
             channel_suffix += "_boundarydist"
+        if fixed_fov:
+            channel_suffix += f"_fixedfov{self.fixed_fov_spacing[0]:g}mm"
         self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}{channel_suffix}") if use_cache else None
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -295,9 +363,20 @@ class PneumoDataset(Dataset):
         key = hashlib.sha1(filepath.encode("utf-8")).hexdigest()
         return os.path.join(self.cache_dir, f"{key}.pt")
 
+    def _resize_channel(self, t: torch.Tensor, bias_high_axis=None) -> torch.Tensor:
+        """t: [1, 1, X, Y, Z] -> [1, *patch_size]. Fixed-FOV mode pads/crops
+        (no interpolation, preserves constant mm/voxel); default mode resizes
+        via trilinear interpolation as before."""
+        if self.fixed_fov:
+            return _pad_or_crop_to_size(t.squeeze(0), self.patch_size, pad_value=0.0,
+                                         bias_high_axis=bias_high_axis)
+        t = F.interpolate(t, size=self.patch_size, mode="trilinear", align_corners=False)
+        return t.squeeze(0)
+
     def _preprocess(self, filepath: str) -> torch.Tensor:
         row = self.meta[filepath]
-        data = _load_reoriented_resampled(filepath)
+        spacing = self.fixed_fov_spacing if self.fixed_fov else RESAMPLE_SPACING
+        data = _load_reoriented_resampled(filepath, spacing=spacing)
 
         if row["extent_z_mm"] >= EXTENDED_FOV_THRESHOLD_MM:
             bbox_min_mm, bbox_max_mm = self.roi[filepath]
@@ -311,8 +390,11 @@ class PneumoDataset(Dataset):
         x = torch.clamp(raw_hu, HU_A_MIN, HU_A_MAX)
         x = (x - HU_A_MIN) / (HU_A_MAX - HU_A_MIN)
         x = x.unsqueeze(0)  # [1, 1, X, Y, Z] (batch, channel, spatial)
-        x = F.interpolate(x, size=self.patch_size, mode="trilinear", align_corners=False)
-        x = x.squeeze(0)  # [1, *patch_size]
+        # z (axis index 2 within the 3 spatial dims) biased to keep the
+        # SUPERIOR end when fixed-FOV forces a crop -- pneumoperitoneum free
+        # air collects near the diaphragm, same bias direction as the old
+        # fixed z-window's asymmetric margin
+        x = self._resize_channel(x, bias_high_axis=2)  # [1, *patch_size]
 
         if self.air_mask_threshold is not None:
             raw_hu_3d = raw_hu.squeeze(0)  # [X, Y, Z]
@@ -330,24 +412,24 @@ class PneumoDataset(Dataset):
                 # known, accepted distribution shift for this experimental path.
                 mask_arr = _refine_air_mask_by_component_score(
                     air_binary.numpy(), body_mask_3d.numpy().astype(bool),
-                    RESAMPLE_SPACING, self.air_mask_classifier_path,
+                    spacing, self.air_mask_classifier_path,
                 )
                 mask = torch.as_tensor(mask_arr).unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
             else:
                 mask = air_binary.float().unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
-            # trilinear (not nearest) so the mask resizes with the same
-            # interpolation as the intensity channel -- produces a "soft" mask
-            # at patch_size resolution (values between 0/1 at former edges)
-            mask = F.interpolate(mask, size=self.patch_size, mode="trilinear", align_corners=False)
-            mask = mask.squeeze(0)  # [1, *patch_size]
+            # same resize/pad treatment as the intensity channel -- trilinear
+            # interpolation (default mode) produces a "soft" mask at
+            # patch_size resolution; fixed-FOV mode pads/crops instead,
+            # matching the intensity channel's own handling exactly so both
+            # channels stay spatially aligned
+            mask = self._resize_channel(mask, bias_high_axis=2)  # [1, *patch_size]
             x = torch.cat([x, mask], dim=0)  # [2, *patch_size]
 
         if self.boundary_distance_channel:
             raw_hu_3d = raw_hu.squeeze(0)  # [X, Y, Z]
-            dist = _compute_boundary_distance_channel(raw_hu_3d, RESAMPLE_SPACING)
+            dist = _compute_boundary_distance_channel(raw_hu_3d, spacing)
             dist = dist.unsqueeze(0).unsqueeze(0)  # [1, 1, X, Y, Z]
-            dist = F.interpolate(dist, size=self.patch_size, mode="trilinear", align_corners=False)
-            dist = dist.squeeze(0)  # [1, *patch_size]
+            dist = self._resize_channel(dist, bias_high_axis=2)  # [1, *patch_size]
             x = torch.cat([x, dist], dim=0)  # [2, *patch_size]
 
         return x
@@ -379,13 +461,16 @@ class PneumoDataset(Dataset):
 
 def make_dataloaders(splits, batch_size: int = BATCH_SIZE, num_workers: int = 0, patch_size=PATCH_SIZE,
                       augment_train: bool = False, air_mask_threshold=None, air_mask_classifier_path=None,
-                      boundary_distance_channel=False):
+                      boundary_distance_channel=False, fixed_fov=False, fixed_fov_spacing=FIXED_FOV_SPACING,
+                      roi_bbox_csv=ROI_BBOX_CSV):
     loaders = {}
     for name, filepaths in splits.items():
         ds = PneumoDataset(filepaths, patch_size=patch_size, augment=(augment_train and name == "train"),
                             air_mask_threshold=air_mask_threshold,
                             air_mask_classifier_path=air_mask_classifier_path,
-                            boundary_distance_channel=boundary_distance_channel)
+                            boundary_distance_channel=boundary_distance_channel,
+                            fixed_fov=fixed_fov, fixed_fov_spacing=fixed_fov_spacing,
+                            roi_bbox_csv=roi_bbox_csv)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             num_workers=num_workers, pin_memory=True,

@@ -28,7 +28,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, confusion_ma
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cv_split import make_cv_folds  # noqa: E402
-from dataset import PneumoDataset  # noqa: E402
+from dataset import ROI_BBOX_CSV, PneumoDataset  # noqa: E402
 from finetune import run_finetune  # noqa: E402
 from model import VistaClassifier  # noqa: E402
 from train import run_linear_probe, set_all_seeds  # noqa: E402
@@ -105,7 +105,9 @@ def get_probs_for_files(checkpoint_path, filepaths, patch_size=224):
     ds = PneumoDataset(filepaths, patch_size=(patch_size,) * 3,
                         air_mask_threshold=config.get("air_mask_threshold"),
                         air_mask_classifier_path=config.get("air_mask_classifier_path"),
-                        boundary_distance_channel=config.get("boundary_distance_channel", False))
+                        boundary_distance_channel=config.get("boundary_distance_channel", False),
+                        fixed_fov=config.get("fixed_fov", False),
+                        roi_bbox_csv=config.get("roi_bbox_csv") or ROI_BBOX_CSV)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     model = VistaClassifier(freeze_encoder=True, hidden_dim=config.get("hidden_dim", 128),

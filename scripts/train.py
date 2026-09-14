@@ -31,7 +31,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import make_dataloaders  # noqa: E402
+from dataset import ROI_BBOX_CSV, make_dataloaders  # noqa: E402
 from model import VistaClassifier  # noqa: E402
 from split import patient_level_split  # noqa: E402
 
@@ -324,6 +324,8 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     air_mask_threshold = getattr(args, "air_mask_threshold", None)
     air_mask_classifier_path = getattr(args, "air_mask_classifier_path", None)
     boundary_distance_channel = getattr(args, "boundary_distance_channel", False)
+    fixed_fov = getattr(args, "fixed_fov", False)
+    roi_bbox_csv = getattr(args, "roi_bbox_csv", None) or ROI_BBOX_CSV
     in_channels = 2 if (air_mask_threshold is not None or boundary_distance_channel) else 1
 
     config = vars(args).copy()
@@ -333,6 +335,8 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
     config["air_mask_threshold"] = air_mask_threshold
     config["air_mask_classifier_path"] = air_mask_classifier_path
     config["boundary_distance_channel"] = boundary_distance_channel
+    config["fixed_fov"] = fixed_fov
+    config["roi_bbox_csv"] = roi_bbox_csv
     config["in_channels"] = in_channels
     with open(os.path.join(run_dir, "split.json"), "w") as f:
         json.dump({k: v for k, v in splits.items()}, f, indent=2)
@@ -342,6 +346,7 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
         air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
         boundary_distance_channel=boundary_distance_channel,
+        fixed_fov=fixed_fov, roi_bbox_csv=roi_bbox_csv,
     )
     print({k: len(v) for k, v in splits.items()})
     if air_mask_threshold is not None:
@@ -349,6 +354,8 @@ def run_linear_probe(splits, run_dir, args, progress_cb=None):
         print(f"Air-mask channel ENABLED: threshold={air_mask_threshold} HU, in_channels=2{refined_note}")
     if boundary_distance_channel:
         print("Boundary-distance channel ENABLED: in_channels=2")
+    if fixed_fov:
+        print(f"Fixed-FOV pipeline ENABLED: roi_bbox_csv={roi_bbox_csv}")
 
     # class imbalance in the train split: weight the positive class by neg/pos
     # ratio so BCEWithLogitsLoss doesn't let the model collapse to predicting
@@ -508,6 +515,14 @@ def parse_args():
                     help="alternative aux channel to --air-mask-threshold: a smooth, unthresholded "
                          "physical distance-to-body-boundary field (mm, normalized to [0,1]) instead "
                          "of a binary/refined air mask. Mutually exclusive with --air-mask-threshold.")
+    p.add_argument("--fixed-fov", action="store_true", default=False,
+                    help="use the fixed-FOV preprocessing path (adaptive_roi_crop.py + constant "
+                         "3mm/voxel spacing, pad/crop instead of resize to patch_size) instead of the "
+                         "default resize-based path. Pair with --roi-bbox-csv pointing at "
+                         "roi_bboxes_adaptive.csv, and --patch-size 224 to match FIXED_FOV_PATCH_SIZE.")
+    p.add_argument("--roi-bbox-csv", type=str, default=None,
+                    help="override the ROI bbox CSV dataset.py reads (default: roi_bboxes.csv). "
+                         "Use roi_bboxes_adaptive.csv together with --fixed-fov.")
     return p.parse_args()
 
 

@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import make_dataloaders  # noqa: E402
+from dataset import ROI_BBOX_CSV, make_dataloaders  # noqa: E402
 from model import VistaClassifier  # noqa: E402
 from split import patient_level_split  # noqa: E402
 from train import build_optimizer, compute_metrics, run_epoch, set_all_seeds  # noqa: E402
@@ -78,7 +78,7 @@ def build_finetune_optimizer(model: VistaClassifier, encoder_lr: float, head_lr:
 
 def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str,
                           expected_air_mask_threshold=None, expected_air_mask_classifier_path=None,
-                          expected_boundary_distance_channel=False
+                          expected_boundary_distance_channel=False, expected_fixed_fov=False
                           ) -> VistaClassifier:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     src_config = ckpt.get("config", {})
@@ -107,6 +107,15 @@ def load_from_checkpoint(checkpoint_path: str, unfreeze_stages, device: str,
     assert src_boundary_distance_channel == expected_boundary_distance_channel, (
         f"boundary_distance_channel mismatch: source checkpoint was trained with "
         f"{src_boundary_distance_channel!r}, but this run was asked for {expected_boundary_distance_channel!r}"
+    )
+    # same mismatch guard for the fixed-FOV (pad/crop, adaptive-ROI-crop)
+    # preprocessing path -- different physical spacing/crop than the default
+    # resize-based path, so fine-tuning on the wrong one silently trains on
+    # differently-scaled input than the linear probe learned from
+    src_fixed_fov = src_config.get("fixed_fov", False)
+    assert src_fixed_fov == expected_fixed_fov, (
+        f"fixed_fov mismatch: source checkpoint was trained with "
+        f"{src_fixed_fov!r}, but this run was asked for {expected_fixed_fov!r}"
     )
 
     model = VistaClassifier(freeze_encoder=True, hidden_dim=hidden_dim, dropout=dropout,
@@ -145,11 +154,14 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     air_mask_threshold = getattr(args, "air_mask_threshold", None)
     air_mask_classifier_path = getattr(args, "air_mask_classifier_path", None)
     boundary_distance_channel = getattr(args, "boundary_distance_channel", False)
+    fixed_fov = getattr(args, "fixed_fov", False)
+    roi_bbox_csv = getattr(args, "roi_bbox_csv", None) or ROI_BBOX_CSV
     loaders = make_dataloaders(
         splits, batch_size=args.batch_size, patch_size=(args.patch_size,) * 3,
         num_workers=args.num_workers, augment_train=getattr(args, "augment", False),
         air_mask_threshold=air_mask_threshold, air_mask_classifier_path=air_mask_classifier_path,
         boundary_distance_channel=boundary_distance_channel,
+        fixed_fov=fixed_fov, roi_bbox_csv=roi_bbox_csv,
     )
     print({k: len(v) for k, v in splits.items()})
 
@@ -163,7 +175,8 @@ def run_finetune(splits, checkpoint_path, run_dir, args, progress_cb=None):
     model, src_ckpt = load_from_checkpoint(checkpoint_path, unfreeze_stages, device,
                                             expected_air_mask_threshold=air_mask_threshold,
                                             expected_air_mask_classifier_path=air_mask_classifier_path,
-                                            expected_boundary_distance_channel=boundary_distance_channel)
+                                            expected_boundary_distance_channel=boundary_distance_channel,
+                                            expected_fixed_fov=fixed_fov)
     optimizer = build_finetune_optimizer(model, args.encoder_lr, args.head_lr)
     scaler = torch.amp.GradScaler(device="cuda", enabled=(args.amp and device == "cuda"))
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
@@ -406,6 +419,10 @@ def parse_args():
                     help="must match the source linear-probe checkpoint's setting")
     p.add_argument("--boundary-distance-channel", action="store_true", default=False,
                     help="must match the source linear-probe checkpoint's setting")
+    p.add_argument("--fixed-fov", action="store_true", default=False,
+                    help="must match the source linear-probe checkpoint's setting")
+    p.add_argument("--roi-bbox-csv", type=str, default=None,
+                    help="override the ROI bbox CSV dataset.py reads (default: roi_bboxes.csv)")
     return p.parse_args()
 
 
