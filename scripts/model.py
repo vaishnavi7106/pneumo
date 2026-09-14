@@ -23,8 +23,11 @@ ENCODER_EMBED_DIM = 48
 BLOCKS_DOWN = (1, 2, 2, 4, 4)
 DEEPEST_CHANNELS = ENCODER_EMBED_DIM * (2 ** (len(BLOCKS_DOWN) - 1))  # 48 * 16 = 768
 
-# exact VISTA3D intensity window (configs/inference.json ScaleIntensityRanged)
-HU_A_MIN = -963.8247715525971
+# Originally VISTA3D's exact intensity window (configs/inference.json
+# ScaleIntensityRanged), a_min=-963.8. Lowered to -1000 (the physical HU
+# floor for air) after finding 63% of true free-air GT voxels clip below
+# -963.8 -- see dataset.py's HU_A_MIN comment and check_hu_window_vs_gt.py.
+HU_A_MIN = -1000.0
 HU_A_MAX = 1053.678477684517
 RESAMPLE_SPACING = (1.5, 1.5, 1.5)
 PATCH_SIZE = (128, 128, 128)

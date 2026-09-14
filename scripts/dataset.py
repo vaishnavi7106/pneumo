@@ -30,7 +30,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIT_CSV = os.path.join(ROOT, "scripts", "audit_results.csv")
 ROI_BBOX_CSV = os.path.join(ROOT, "scripts", "roi_bboxes.csv")
 
-HU_A_MIN = -963.8247715525971
+# NOTE: HU_A_MIN was originally VISTA3D's own pretrained window floor
+# (-963.8), tuned for multi-organ segmentation (soft tissue/bone), not air.
+# Checked against the 23 GT free-air segmentations (merged/GT/,
+# check_hu_window_vs_gt.py): 63% of true free-air voxels have raw HU below
+# -963.8 (median -979) and were clipping to the same normalized value as
+# zero-padding/background -- indistinguishable from "no signal" to the
+# model. -1000 HU is the physical calibration floor for air (no CT voxel
+# goes below it), so it captures the full free-air range with zero clipping.
+HU_A_MIN = -1000.0
 HU_A_MAX = 1053.678477684517
 RESAMPLE_SPACING = (1.5, 1.5, 1.5)
 PATCH_SIZE = (128, 128, 128)
@@ -77,19 +85,23 @@ BODY_MASK_CLOSING_ITERATIONS = 3
 # smaller volume up to a fixed voxel grid with a constant background value,
 # and only cropping (never resizing) when a case's extent exceeds the grid,
 # biased to preserve the superior end in z (where free air collects).
-# Coarser than RESAMPLE_SPACING (1.5mm) since the adaptive crop's physical
-# extents run several hundred mm -- covering that at 1.5mm/voxel would need
-# a voxel grid too large for available GPU memory.
-FIXED_FOV_SPACING = (3.0, 3.0, 3.0)
-# 672mm coverage per axis at 3.0mm/voxel -- sized from the REAL adaptive-crop
-# extent distribution across all 333 extended-FOV volumes
-# (roi_bboxes_adaptive.csv): x up to 496mm, y up to 410mm, z up to 685mm
-# (median z alone is 520mm -- a full torso scan has real tissue at nearly
-# every z-slice, see adaptive_roi_crop.py's docstring). At 224^3 only 1/333
-# volumes (0.3%) still exceeds this in z, by 13mm -- everything else fits
-# with zero truncation. A smaller grid (e.g. 160^3, covers only 480mm)
-# truncated z on 77.5% of volumes -- checked and rejected.
-FIXED_FOV_PATCH_SIZE = (224, 224, 224)
+# NOTE: originally set to 3.0mm (2x coarser than RESAMPLE_SPACING) to let a
+# CUBIC 224^3 canvas cover the largest case without resize. A real 5-fold CV
+# run at that setting collapsed to near-chance (AUROC 0.51, AUPRC 0.43,
+# specificity 0.30) -- far below the pre-fixed-FOV baseline (~0.666/0.588).
+# Root cause: pneumoperitoneum is free air, often thin (a few mm) crescents
+# along the peritoneum -- doubling voxel spacing to 3mm (8x fewer voxels)
+# likely blurred/destroyed exactly that signal during resample. Reverted to
+# match RESAMPLE_SPACING (1.5mm) and switched to a non-cubic canvas sized
+# from the real per-axis adaptive-crop extent distribution
+# (roi_bboxes_adaptive.csv, 333 extended-FOV volumes) instead of forcing a
+# cube -- x/y have real headroom (p99 463mm/367mm) while z needs much more
+# (p99 640mm, since a full torso scan has real tissue at nearly every
+# z-slice). Sized to each axis's p99 + margin, rounded up to a multiple of
+# 16, re-validated for 0/23 GT loss via validate_fixed_fov_pipeline.py before
+# use.
+FIXED_FOV_SPACING = (1.5, 1.5, 1.5)
+FIXED_FOV_PATCH_SIZE = (336, 256, 432)
 
 
 def _pad_or_crop_to_size(x: torch.Tensor, target_size, pad_value: float = 0.0, bias_high_axis=None):
@@ -283,7 +295,13 @@ class PneumoDataset(Dataset):
                  air_mask_classifier_path=None, boundary_distance_channel=False, fixed_fov=False,
                  fixed_fov_spacing=FIXED_FOV_SPACING):
         self.filepaths = list(filepaths)
-        self.patch_size = tuple(patch_size)
+        # fixed_fov mode uses its own non-cubic canvas (FIXED_FOV_PATCH_SIZE)
+        # sized from the real per-axis ROI extent distribution -- the scalar
+        # `patch_size` arg (driven by train.py/finetune.py's single
+        # --patch-size CLI int, always expanded to a cube) cannot express
+        # that shape, so it is ignored here rather than silently truncating
+        # z to whatever cube the caller happened to pass.
+        self.patch_size = tuple(FIXED_FOV_PATCH_SIZE) if fixed_fov else tuple(patch_size)
         self.use_cache = use_cache
         # fixed-FOV mode: pad/crop instead of resize (see _pad_or_crop_to_size
         # and the FIXED_FOV_* constants above) -- keeps mm/voxel constant
@@ -317,9 +335,15 @@ class PneumoDataset(Dataset):
             "air_mask_threshold and boundary_distance_channel are alternative aux channels -- "
             "pick one, not both"
         )
-        # cache is keyed by patch_size AND channel config since the same volume
-        # produces a different tensor at 128^3 vs 224^3, and a 1-channel vs
-        # 2-channel (air-mask) tensor is a completely different shape/content
+        # cache is keyed by patch_size, channel config, AND the HU intensity
+        # window since all three change the cached tensor's shape/content --
+        # patch_size[0] alone is not a safe key now that non-cubic sizes are
+        # in use (two different non-cubic shapes could share dim 0), and the
+        # HU window isn't reflected in shape at all, so a silent change there
+        # (e.g. HU_A_MIN -963.8 -> -1000, see the HU_A_MIN comment above)
+        # would otherwise reuse stale cached tensors under the same dir name.
+        size_tag = "x".join(str(s) for s in self.patch_size)
+        hu_tag = f"_hu{HU_A_MIN:g}to{HU_A_MAX:g}"
         channel_suffix = f"_airmask{air_mask_threshold:g}" if air_mask_threshold is not None else ""
         if air_mask_classifier_path is not None:
             channel_suffix += "_refined"
@@ -327,7 +351,7 @@ class PneumoDataset(Dataset):
             channel_suffix += "_boundarydist"
         if fixed_fov:
             channel_suffix += f"_fixedfov{self.fixed_fov_spacing[0]:g}mm"
-        self.cache_dir = os.path.join(cache_dir, f"{self.patch_size[0]}{channel_suffix}") if use_cache else None
+        self.cache_dir = os.path.join(cache_dir, f"{size_tag}{channel_suffix}{hu_tag}") if use_cache else None
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
 
