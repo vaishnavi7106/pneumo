@@ -148,6 +148,26 @@ class VistaClassifier(nn.Module):
         # already handled that correctly, nothing more to do.
         return self
 
+    def _encode_deepest(self, x: torch.Tensor) -> torch.Tensor:
+        """Walk encoder.layers directly instead of calling self.encoder(x).
+
+        SegResEncoder._forward returns a list of ALL 5 multi-scale stage
+        outputs (for VISTA3D's segmentation decoder, which needs them all).
+        We only ever use stages[-1] (the deepest, 768ch), but the built-in
+        forward keeps every earlier stage alive in a Python list until the
+        whole function returns -- and stage 0 is at FULL input resolution.
+        At the fixed-FOV canvas size (336x256x432) that list holds ~4.75GB
+        (fp16) of tensors that are never used, ~170x the size of the one
+        tensor we actually need (28MB) -- large enough on its own to be a
+        real factor in a 24GB-GPU OOM. Recomputing the same layers here
+        without ever building that list avoids retaining them at all.
+        """
+        x = self.encoder.conv_init(x)
+        for level in self.encoder.layers:
+            x = level["blocks"](x)
+            x = level["downsample"](x)
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, 1, D, H, W] in [0, 1], already resampled/cropped/oriented
         if self.freeze_encoder:
@@ -155,10 +175,9 @@ class VistaClassifier(nn.Module):
             # since encoder params are frozen -- without this, memory would include
             # a full backward graph through 175M frozen params for no benefit.
             with torch.no_grad():
-                stages = self.encoder(x)  # list of 5 multi-scale feature maps
+                deepest = self._encode_deepest(x)  # [B, 768, D/16, H/16, W/16]
         else:
-            stages = self.encoder(x)
-        deepest = stages[-1]      # [B, 768, D/16, H/16, W/16]
+            deepest = self._encode_deepest(x)
         pooled = self.pool(deepest)
         logit = self.head(pooled)  # [B, 1]
         return logit.squeeze(-1)
